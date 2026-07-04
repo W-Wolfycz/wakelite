@@ -1,0 +1,121 @@
+{
+  "whitelist_groups": {
+    "description": "群聊白名单",
+    "type": "list",
+    "default": [],
+    "hint": "群号列表（字符串或数字均可）。只有在列表中的群聊会走唤醒判定逻辑；列表为空时所有群聊都不会被本插件处理——若希望某些群启用，请把群号加入此列表。"
+  },
+  "bots": {
+    "description": "多 bot 分流",
+    "type": "list",
+    "default": [],
+    "hint": "多 bot 共用一份配置时，把「概率/答疑/无聊/兴趣/相关性」5 个唤醒按消息哈希分流到指定 bot，避免一次提问多个 bot 同时响应。每项形如 {\"platform_id\": \"aiocqhttp\", \"self_id\": \"12345\"}。空列表 = 关闭分流（每个 bot 独立判定，跟单 bot 一样）。注意：人格名唤醒、复读过滤、唤醒 CD、群白名单 gate 不参与分流，所有 bot 都跑。配置错误（如 self_id 不在列表）导致消息被吞，由用户自行承担"
+  },
+  "use_chat_memory": {
+    "description": "启用 chat_memory 数据源",
+    "type": "bool",
+    "default": true,
+    "hint": "开启时，bot 历史回复从 chat_memory 插件读取（需先安装该插件：https://github.com/W-Wolfycz/chat_memory）；关闭时，回退到 AstrBot 自带的 conversation history。chat_memory 路径下 bot_msgs_ttl 才会生效（自带 history 无时间戳）"
+  },
+  "persona_name_prob": {
+    "description": "人格名唤醒概率",
+    "type": "float",
+    "slider": {
+      "min": 0,
+      "max": 1,
+      "step": 0.01
+    },
+    "default": 0.5,
+    "hint": "【概率类，越大越易唤醒，0=关闭】消息含当前人格名时，按此概率决定是否唤醒（0.0-1.0）。例：0.5 表示命中人格名后有 50% 概率唤醒。"
+  },
+  "persona_name_cache_ttl": {
+    "description": "人格名缓存分钟数",
+    "type": "int",
+    "default": 1,
+    "hint": "缓存当前人格名的分钟数，避免每次唤醒判定都查 DB。0 表示不缓存（每条消息都查一次，开销大，不建议）。建议 1-5。"
+  },
+  "prob": {
+    "description": "概率唤醒",
+    "type": "float",
+    "slider": {
+      "min": 0,
+      "max": 1,
+      "step": 0.001
+    },
+    "default": 0.0,
+    "hint": "【概率类，越大越易唤醒，0=关闭】每条消息兜底唤醒概率（0.0-1.0）。建议保持较低值（0.01-0.1），过高会让 bot 对无关消息也频繁响应。"
+  },
+  "ask_threshold": {
+    "description": "答疑唤醒阈值",
+    "type": "float",
+    "slider": {
+      "min": 0,
+      "max": 1,
+      "step": 0.01
+    },
+    "default": 0.5,
+    "hint": "【阈值类，越大越严，1=关闭】消息的「提问意图」分数大于此值时唤醒（0.0-1.0）。基于内置词表（请问/为什么/怎么等）+ 否定词/反问句处理 + sigmoid 归一化。0.5 默认，扰民多可调高到 0.7。"
+  },
+  "bored_threshold": {
+    "description": "无聊唤醒阈值",
+    "type": "float",
+    "slider": {
+      "min": 0,
+      "max": 1,
+      "step": 0.01
+    },
+    "default": 0.5,
+    "hint": "【阈值类，越大越严，1=关闭】消息的「无聊表达」分数大于此值时唤醒（0.0-1.0）。检测「好无聊/死群/有人吗」等冷场信号，适合死群救援。0.5 默认，过严会漏救。"
+  },
+  "interest_words": {
+    "description": "兴趣关键词包",
+    "type": "list",
+    "default": [],
+    "hint": "关键词包列表，每项是一行空格分隔的关键词。例：[\"原神 风 神 鸡\", \"崩坏 星穹铁道\"]。消息命中任一关键词包且分数超 interest_threshold 时唤醒。关键词权重按长度递增（1字0.8 / 2字1.2 / 3字1.5 / 4字+1.8）。"
+  },
+  "interest_threshold": {
+    "description": "兴趣唤醒阈值",
+    "type": "float",
+    "slider": {
+      "min": 0,
+      "max": 1,
+      "step": 0.01
+    },
+    "default": 0.5,
+    "hint": "【阈值类，越大越严，1=关闭】消息命中自定义关键词包的「兴趣分数」大于此值时唤醒（0.0-1.0）。需配合 interest_words 使用。0.5 默认。"
+  },
+  "similar_threshold": {
+    "description": "相关性唤醒阈值",
+    "type": "float",
+    "slider": {
+      "min": 0,
+      "max": 1,
+      "step": 0.01
+    },
+    "default": 0.5,
+    "hint": "【阈值类，越大越严，1=关闭】消息与 bot 最近 N 条回复的 TF-IDF 余弦相似度大于此值时唤醒（0.0-1.0）。0.5 默认，容易误判可调高到 0.65-0.7。"
+  },
+  "bot_msgs_maxlen": {
+    "description": "Bot 历史条数上限",
+    "type": "int",
+    "default": 5,
+    "hint": "用于复读检测和相关性的 bot 回复最大条数。chat_memory 启用时作为 query_history 的 limit 参数；未启用时从 AstrBot history 末尾截取。建议 3-10。"
+  },
+  "bot_msgs_ttl": {
+    "description": "Bot 历史过期分钟数",
+    "type": "int",
+    "default": 10,
+    "hint": "Bot 回复的最大存活分钟数。超过此时间的记录会被复读检测和相关性忽略。仅在 use_chat_memory=true 时生效（AstrBot 自带 history 无时间戳字段）。0 表示不过期（仅按 bot_msgs_maxlen 截断）。默认 10 分钟。"
+  },
+  "wake_cd": {
+    "description": "唤醒冷却时间（秒）",
+    "type": "float",
+    "slider": {
+      "min": 0,
+      "max": 10,
+      "step": 0.1
+    },
+    "default": 0.5,
+    "hint": "同一用户两次唤醒的最小间隔（秒）。冷却期内该用户的消息不会触发任何唤醒判定（人格名/概率/答疑/无聊/兴趣/相关性都不跑）。每人独立计时。0 表示关闭冷却。默认 0.5 秒，主要用于防止短时间内重复触发昂贵的 jieba 分词 + TF-IDF 计算。"
+  }
+}
