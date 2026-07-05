@@ -19,10 +19,7 @@ _CTX_CLEAN_RE = re.compile(r"<[^>]+>")
 
 
 class WakeLitePlugin(Star):
-    """轻量唤醒：人格名（按概率）+ 概率 + 答疑 + 无聊 + 兴趣 + 相关性。
-    含群聊白名单准入、唤醒 CD、复读过滤、多 bot 分流。
-    bot 历史来源：chat_memory（推荐）或 AstrBot 自带 conversation history。
-    """
+    """轻量唤醒：人格名/概率/答疑/无聊/兴趣/相关性 + 群白名单 + CD + 复读过滤 + 多 bot 分流。"""
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -47,16 +44,25 @@ class WakeLitePlugin(Star):
         self.interest_words: list[list[str]] = [
             [w for w in s.split() if w] for s in interest_words_str
         ]
-        # 多 bot 分流：bots 顺序列表 + 快速查位置 dict
-        # 每项是 (platform_id, self_id) 元组，用户配置 bots list of {platform_id, self_id}
+        # 多 bot 分流：每项 "platform_id:self_id" 字符串
+        log_conf = config.get("log_config", {}) or {}
+        self.log_with_bot_id = bool(log_conf.get("log_with_bot_id", True))
+        self.debug_to_info = bool(log_conf.get("debug_to_info", False))
+
         bots_raw = config.get("bots", []) or []
         self.bots: list[tuple[str, str]] = []
         self.bots_index: dict[tuple[str, str], int] = {}
-        for b in bots_raw:
-            if not isinstance(b, dict):
+        for entry in bots_raw:
+            s = entry.strip() if isinstance(entry, str) else ""
+            if not s:
                 continue
-            pid = str(b.get("platform_id", "")).strip()
-            sid = str(b.get("self_id", "")).strip()
+            if ":" not in s:
+                logger.warning(
+                    f"{self._log_prefix()} bots 配置项格式错误（应为 platform_id:self_id）：{s}"
+                )
+                continue
+            pid, sid = s.split(":", 1)
+            pid, sid = pid.strip(), sid.strip()
             if not (pid and sid):
                 continue
             key = (pid, sid)
@@ -76,19 +82,23 @@ class WakeLitePlugin(Star):
         self._last_wake: dict[str, float] = {}
 
         logger.info(
-            f"[WakeLite] 已加载：人格名={self.persona_name_prob}, "
+            f"{self._log_prefix()} 已加载：人格名={self.persona_name_prob}, "
             f"概率={self.prob}, 答疑={self.ask_threshold}, "
             f"无聊={self.bored_threshold}, 兴趣={self.interest_threshold}, "
             f"相关性={self.similar_threshold}, CD={self.wake_cd}s, "
             f"白名单群={len(self.whitelist_groups)}个, "
             f"兴趣关键词包={len(self.interest_words)}个, "
             f"分流bots={len(self.bots)}个, "
-            f"使用chat_memory={self.use_chat_memory}"
+            f"使用chat_memory={self.use_chat_memory}, "
+            f"日志区分bot={self.log_with_bot_id}, "
+            f"调试提级={self.debug_to_info}"
         )
 
     # ===================== 人格名缓存 =====================
 
-    async def _get_persona_name(self, umo: str) -> str | None:
+    async def _get_persona_name(
+        self, umo: str, event: AstrMessageEvent | None = None
+    ) -> str | None:
         cached = self._persona_name_cache.get(umo)
         now = time.time()
         if cached and now - cached[1] < self.persona_name_cache_ttl:
@@ -96,32 +106,26 @@ class WakeLitePlugin(Star):
         try:
             persona = await self.persona_mgr.get_default_persona_v3(umo)
         except Exception as e:
-            logger.warning(f"[WakeLite] 获取人格失败 umo={umo}: {e}")
+            logger.warning(f"{self._log_prefix(event)} 获取人格失败 umo={umo}: {e}")
             return None
         name = persona.get("name") if persona else None
         if name:
             self._persona_name_cache[umo] = (name, now)
-            logger.debug(f"[WakeLite] 人格名缓存更新 umo={umo} name={name}")
+            self._log(f"人格名缓存更新 umo={umo} name={name}", event=event)
         return name
 
     # ===================== Bot 历史获取 =====================
 
     async def _get_bot_msgs(self, umo: str, uid: str) -> tuple[list[str], list[str]]:
-        """获取本会话近期 bot 回复，按 tag 分流。
+        """返回 (reread_msgs, similarity_msgs)。
 
-        返回 (reread_msgs, similarity_msgs)：
-        - reread_msgs: 所有 assistant 消息（含 non_llm 命令回复、复读插件等），
-          用于复读检测——避免用户/ bot 互相复读无限循环
-        - similarity_msgs: 仅 tag='llm_success'（LLM 真实回复），
-          用于相关性唤醒——避免 /help 这类模板回复污染 TF-IDF
-
-        AstrBot history 兜底路径无 tag 字段，统一视为 llm_success（同时进两个 list）。
-        每个分支独立 maxlen 截断 + TTL 过滤。
+        reread 用所有 assistant（含 non_llm，覆盖复读插件），
+        similarity 仅 llm_success（避免模板回复污染 TF-IDF）。
         """
         try:
             conv_id = await self.conv_mgr.get_curr_conversation_id(umo) or ""
         except Exception as e:
-            logger.warning(f"[WakeLite] 获取 conversation_id 失败: {e}")
+            logger.warning(f"{self._log_prefix()} 获取 conversation_id 失败: {e}")
             return [], []
         if not conv_id:
             return [], []
@@ -152,7 +156,6 @@ class WakeLitePlugin(Star):
                 if ts is not None and now - ts > self.bot_msgs_ttl:
                     continue
             reread_msgs.append(content)
-            # 兜底路径无 tag → 视为 LLM 回复（保留旧行为）
             if r.get("tag") == "llm_success" or "tag" not in r:
                 similarity_msgs.append(content)
 
@@ -165,11 +168,7 @@ class WakeLitePlugin(Star):
         return reread_msgs, similarity_msgs
 
     async def _query_chat_memory(self, umo: str, conv_id: str, uid: str) -> list[dict]:
-        """调用 chat_memory v2.0+ 的 query_history。
-
-        只在 SQL 层过滤 role='assistant'，不限制 tag——tag 分流交给
-        _get_bot_msgs 在 Python 层做（reread 要宽，similarity 要严）。
-        """
+        """从 chat_memory v2.0+ 查 assistant 消息，tag 分流交给上层。"""
         star = self.context.get_registered_star("chat_memory")
         if star is None:
             return []
@@ -185,7 +184,7 @@ class WakeLitePlugin(Star):
                 role_filter="assistant",
             )
         except Exception as e:
-            logger.warning(f"[WakeLite] chat_memory 查询失败: {e}")
+            logger.warning(f"{self._log_prefix()} chat_memory 查询失败: {e}")
             return []
 
     async def _read_astrbot_history(self, umo: str, conv_id: str) -> list[dict]:
@@ -207,7 +206,7 @@ class WakeLitePlugin(Star):
                     result.append({"role": role, "content": content})
             return result
         except Exception as e:
-            logger.warning(f"[WakeLite] 读取 AstrBot 上下文失败: {e}")
+            logger.warning(f"{self._log_prefix()} 读取 AstrBot 上下文失败: {e}")
             return []
 
     @staticmethod
@@ -223,6 +222,24 @@ class WakeLitePlugin(Star):
             return datetime.fromisoformat(str(value)).timestamp()
         except (TypeError, ValueError):
             return None
+
+    # ===================== 日志 =====================
+
+    def _log_prefix(self, event: AstrMessageEvent | None = None) -> str:
+        if self.log_with_bot_id and event is not None:
+            try:
+                sid = event.get_self_id()
+                return f"[WakeLite:{sid}]"
+            except Exception:
+                pass
+        return "[WakeLite]"
+
+    def _log(self, msg: str, event: AstrMessageEvent | None = None) -> None:
+        line = f"{self._log_prefix(event)} {msg}"
+        if self.debug_to_info:
+            logger.info(line)
+        else:
+            logger.debug(line)
 
     # ===================== 通用工具 =====================
 
@@ -251,7 +268,7 @@ class WakeLitePlugin(Star):
     def _wake(self, event: AstrMessageEvent, uid: str, now: float, reason: str) -> None:
         event.is_at_or_wake_command = True
         self._last_wake[uid] = now
-        logger.info(reason)
+        logger.info(f"{self._log_prefix(event)} {reason}")
 
     # ===================== 多 bot 分流 =====================
 
@@ -259,10 +276,7 @@ class WakeLitePlugin(Star):
     def _stable_hash(event: AstrMessageEvent) -> int:
         """稳定哈希：同一消息在所有 bot 上算出同一 int 值，供多 bot 分流。
 
-        输入只取「消息本身」相关字段，不含时间、平台实例、bot ID：
-          - 优先 message_id（平台原生 ID，所有 bot 看到同一条消息时一致）
-          - 缺失时退到 umo + sender_id + content
-        返回大整数，调用方 mod N 即可映射到 [0, N)。
+        优先 message_id，缺失时退到 umo+sender+content。
         """
         msg_obj = getattr(event, "message_obj", None)
         msg_id = getattr(msg_obj, "message_id", "") if msg_obj else ""
@@ -276,14 +290,10 @@ class WakeLitePlugin(Star):
         return int(hashlib.md5(key.encode("utf-8")).hexdigest()[:8], 16)
 
     def _compute_my_turn(self, event: AstrMessageEvent, uid: str, bid: str) -> bool:
-        """计算当前 bot 是否轮到跑阈值/概率类判定（多 bot 分流）。
+        """当前 bot 是否轮到跑阈值/概率类判定（多 bot 分流）。
 
-        - 未配置 bots → 单 bot 模式，永远返回 True
-        - self_id 不在 bots 列表 → 返回 False（配置错误，消息丢就丢）
-        - 用户消息（sender 不在 bots）→ 池大小 = N，原 bots 列表
-        - bot 消息（sender 在 bots）→ 池大小 = N-1，原 bots 列表除去 sender
-
-        人格名唤醒、复读过滤、CD、白名单 gate 不调用本方法（所有 bot 都跑）。
+        未配置 bots → True；当前 bot 不在列表 → False；
+        用户消息 → 全部 bots 池；bot 消息 → 除去发送者的池。
         """
         if not self.bots:
             return True
@@ -291,8 +301,9 @@ class WakeLitePlugin(Star):
         my_pid = event.get_platform_id()
         my_key = (my_pid, bid)
         if my_key not in self.bots_index:
-            logger.debug(
-                f"[WakeLite] ({my_pid}, {bid}) 不在 bots 列表，跳过阈值分流"
+            self._log(
+                f"({my_pid}, {bid}) 不在 bots 列表，跳过阈值分流",
+                event=event,
             )
             return False
 
@@ -340,9 +351,9 @@ class WakeLitePlugin(Star):
         if self.wake_cd > 0:
             last = self._last_wake.get(uid, 0.0)
             if now - last < self.wake_cd:
-                logger.debug(
-                    f"[WakeLite] 唤醒CD中 uid={uid} "
-                    f"剩余{self.wake_cd - (now - last):.2f}s"
+                self._log(
+                    f"唤醒CD中 uid={uid} 剩余{self.wake_cd - (now - last):.2f}s",
+                    event=event,
                 )
                 return
 
@@ -351,32 +362,33 @@ class WakeLitePlugin(Star):
 
         # 复读过滤（含 non_llm，识别复读插件等场景）
         if self._is_reread(plain, reread_msgs):
-            logger.debug(f"[WakeLite] 复读拦截 umo={umo}")
+            self._log(f"复读拦截 umo={umo}", event=event)
             return
 
         # 多 bot 分流：未轮到我则跳过阈值/概率类判定（人格名仍跑）
         is_my_turn = self._compute_my_turn(event, uid, bid)
 
-        # 1. 人格名唤醒（命中后按概率；所有 bot 都跑，不受分流影响）
+        # 1. 人格名唤醒（所有 bot 都跑，不受分流影响）
         if self.persona_name_prob > 0:
-            persona_name = await self._get_persona_name(umo)
+            persona_name = await self._get_persona_name(umo, event=event)
             if persona_name and persona_name in plain:
                 if random.random() < self.persona_name_prob:
                     self._wake(event, uid, now,
-                               f"[WakeLite] 人格名唤醒 umo={umo} name={persona_name}")
+                               f"人格名唤醒 umo={umo} name={persona_name}")
                     return
-                logger.debug(
-                    f"[WakeLite] 人格名命中但概率未过 umo={umo} name={persona_name}"
+                self._log(
+                    f"人格名命中但概率未过 umo={umo} name={persona_name}",
+                    event=event,
                 )
 
         # 下面 5 项受多 bot 分流影响：未轮到我则跳过
         if not is_my_turn:
-            logger.debug(f"[WakeLite] 非本 bot 分流轮次 uid={uid} 跳过阈值判定")
+            self._log(f"非本 bot 分流轮次 uid={uid} 跳过阈值判定", event=event)
             return
 
         # 2. 概率唤醒
         if self.prob > 0 and random.random() < self.prob:
-            self._wake(event, uid, now, f"[WakeLite] 概率唤醒 umo={umo}")
+            self._wake(event, uid, now, f"概率唤醒 umo={umo}")
             return
 
         # 3. 答疑唤醒
@@ -384,11 +396,11 @@ class WakeLitePlugin(Star):
             try:
                 score = sentiment.ask(plain)
             except Exception as e:
-                logger.warning(f"[WakeLite] 答疑打分失败: {e}")
+                logger.warning(f"{self._log_prefix(event)} 答疑打分失败: {e}")
                 score = 0.0
             if score > self.ask_threshold:
                 self._wake(event, uid, now,
-                           f"[WakeLite] 答疑唤醒 umo={umo} score={score:.3f}")
+                           f"答疑唤醒 umo={umo} score={score:.3f}")
                 return
 
         # 4. 无聊唤醒
@@ -396,11 +408,11 @@ class WakeLitePlugin(Star):
             try:
                 score = sentiment.bored(plain)
             except Exception as e:
-                logger.warning(f"[WakeLite] 无聊打分失败: {e}")
+                logger.warning(f"{self._log_prefix(event)} 无聊打分失败: {e}")
                 score = 0.0
             if score > self.bored_threshold:
                 self._wake(event, uid, now,
-                           f"[WakeLite] 无聊唤醒 umo={umo} score={score:.3f}")
+                           f"无聊唤醒 umo={umo} score={score:.3f}")
                 return
 
         # 5. 兴趣唤醒
@@ -408,24 +420,24 @@ class WakeLitePlugin(Star):
             try:
                 score = self.interest.calc_interest(plain)
             except Exception as e:
-                logger.warning(f"[WakeLite] 兴趣打分失败: {e}")
+                logger.warning(f"{self._log_prefix(event)} 兴趣打分失败: {e}")
                 score = 0.0
             if score > self.interest_threshold:
                 self._wake(event, uid, now,
-                           f"[WakeLite] 兴趣唤醒 umo={umo} score={score:.3f}")
+                           f"兴趣唤醒 umo={umo} score={score:.3f}")
                 return
 
-        # 6. 相关性唤醒（最贵，最后；仅比对 LLM 回复，避免模板污染）
+        # 6. 相关性唤醒（仅比对 LLM 回复）
         if self.similar_threshold < 1 and similarity_msgs:
             try:
                 sim = self.similarity.similarity(umo, plain, similarity_msgs)
             except Exception as e:
-                logger.warning(f"[WakeLite] 相关性计算失败: {e}")
+                logger.warning(f"{self._log_prefix(event)} 相关性计算失败: {e}")
                 sim = 0.0
             if sim > self.similar_threshold:
                 self._wake(event, uid, now,
-                           f"[WakeLite] 相关性唤醒 umo={umo} sim={sim:.3f}")
+                           f"相关性唤醒 umo={umo} sim={sim:.3f}")
                 return
 
     async def terminate(self):
-        logger.info("[WakeLite] 已停用")
+        logger.info(f"{self._log_prefix()} 已停用")
