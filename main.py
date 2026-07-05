@@ -276,17 +276,14 @@ class WakeLitePlugin(Star):
     def _stable_hash(event: AstrMessageEvent) -> int:
         """稳定哈希：同一消息在所有 bot 上算出同一 int 值，供多 bot 分流。
 
-        优先 message_id，缺失时退到 umo+sender+content。
+        只用 (group_id, sender_id, content) 三个跨 bot 一致字段。
+        弃用 message_id（OneBot 不同实现间可能不一致）和 umo（含 platform_id，
+        每 bot 不同）。
         """
-        msg_obj = getattr(event, "message_obj", None)
-        msg_id = getattr(msg_obj, "message_id", "") if msg_obj else ""
-        if msg_id:
-            key = f"mid:{msg_id}"
-        else:
-            umo = event.unified_msg_origin
-            sender = event.get_sender_id()
-            content = event.message_str or ""
-            key = f"{umo}|{sender}|{content}"
+        group_id = event.get_group_id() or ""
+        sender = event.get_sender_id()
+        content = event.message_str or ""
+        key = f"{group_id}|{sender}|{content}"
         return int(hashlib.md5(key.encode("utf-8")).hexdigest()[:8], 16)
 
     def _compute_my_turn(self, event: AstrMessageEvent, uid: str, bid: str) -> bool:
