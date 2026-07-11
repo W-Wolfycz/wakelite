@@ -156,7 +156,7 @@ class WakeLitePlugin(Star):
                 if ts is not None and now - ts > self.bot_msgs_ttl:
                     continue
             reread_msgs.append(content)
-            if r.get("tag") == "llm_success" or "tag" not in r:
+            if r.get("llm_status") == "llm_success" or "llm_status" not in r:
                 similarity_msgs.append(content)
 
         if self.bot_msgs_maxlen <= 0:
@@ -168,7 +168,7 @@ class WakeLitePlugin(Star):
         return reread_msgs, similarity_msgs
 
     async def _query_chat_memory(self, umo: str, conv_id: str, uid: str) -> list[dict]:
-        """从 chat_memory v2.0+ 查 assistant 消息，tag 分流交给上层。"""
+        """从 chat_memory v2.3+ 查 assistant 消息，llm_status 分流交给上层。"""
         star = self.context.get_registered_star("chat_memory")
         if star is None:
             return []
