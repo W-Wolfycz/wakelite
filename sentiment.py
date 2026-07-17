@@ -4,8 +4,6 @@ from functools import lru_cache
 
 import jieba
 
-jieba.add_word("傻逼")
-
 
 class Sentiment:
     """文本情绪/意图打分（ASK / BORED 两类）。
@@ -17,7 +15,7 @@ class Sentiment:
 
     STOP = {
         "的", "了", "在", "是", "都", "就", "也", "和", "把",
-        "我", "你", "他", "她", "它", "啊", "吧", "吗", "嘛",
+        "我", "你", "他", "她", "它", "啊", "吧", "嘛",
     }
 
     # 提问类（按提问明确度分级，weight × intensity）
@@ -95,6 +93,15 @@ class Sentiment:
     RHETORICAL_WORDS = {"难道", "何必", "怎么可以", "怎么可能", "哪能", "岂能", "谁还"}
 
     def __init__(self, cache_size: int = 2048):
+        # 使用独立 Tokenizer，避免修改 AstrBot 进程内其他插件共享的 jieba 词典。
+        self._tokenizer = jieba.Tokenizer()
+        for word in (
+            set(self.ASK_WORDS)
+            | set(self.BORED_WORDS)
+            | self.NEGATION_WORDS
+            | self.RHETORICAL_WORDS
+        ):
+            self._tokenizer.add_word(word)
         self._install_seg_cache(cache_size)
 
     def _install_seg_cache(self, size: int) -> None:
@@ -103,7 +110,9 @@ class Sentiment:
         @lru_cache(maxsize=size)
         def cached(text: str) -> tuple[str, ...]:
             text = re.sub(r"[^\w\s一-鿿]", "", text.lower())
-            return tuple(w for w in jieba.lcut(text) if w.strip() and w not in stop)
+            return tuple(
+                w for w in self._tokenizer.lcut(text) if w.strip() and w not in stop
+            )
 
         self._cached_seg = cached
 
@@ -111,11 +120,19 @@ class Sentiment:
         """分词并过滤停用词。带 LRU 缓存，同文本只算一次。"""
         return list(self._cached_seg(text))
 
-    def _calculate_confidence(self, words: list[str], keyword_dict: dict) -> float:
+    def _calculate_confidence(
+        self,
+        text: str,
+        words: list[str],
+        keyword_dict: dict,
+    ) -> float:
         # 1. 基础匹配分数
         base_score = 0.0
         matched: list[str] = []
-        has_rhetorical = any(r in words for r in self.RHETORICAL_WORDS)
+        has_rhetorical = any(
+            rhetorical in words or rhetorical in text
+            for rhetorical in self.RHETORICAL_WORDS
+        )
 
         for i, word in enumerate(words):
             if word in keyword_dict:
@@ -132,13 +149,15 @@ class Sentiment:
                 base_score += weight * intensity
                 matched.append(word)
 
+        if not matched:
+            return 0.0
+
         # 2. 上下文增强
         context_score = 0.0
-        if matched:
-            density = len(matched) / len(words) if words else 0
-            context_score += min(1.0, density * 5) * 0.5
-            if len(matched) > 1:
-                context_score += min(1.0, (len(matched) - 1) * 0.4)
+        density = len(matched) / len(words) if words else 0
+        context_score += min(1.0, density * 5) * 0.5
+        if len(matched) > 1:
+            context_score += min(1.0, (len(matched) - 1) * 0.4)
 
         # 3. Sigmoid 归一化
         total = base_score + context_score
@@ -147,11 +166,21 @@ class Sentiment:
 
     def ask(self, text: str) -> float:
         """提问意图强度（0-1）。"""
-        return self._calculate_confidence(self.seg(text), self.ASK_WORDS)
+        normalized = text.lower()
+        return self._calculate_confidence(
+            normalized,
+            self.seg(normalized),
+            self.ASK_WORDS,
+        )
 
     def bored(self, text: str) -> float:
         """无聊表达强度（0-1）。"""
-        return self._calculate_confidence(self.seg(text), self.BORED_WORDS)
+        normalized = text.lower()
+        return self._calculate_confidence(
+            normalized,
+            self.seg(normalized),
+            self.BORED_WORDS,
+        )
 
 
 sentiment = Sentiment()

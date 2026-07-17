@@ -15,7 +15,14 @@
     "description": "启用 chat_memory 数据源",
     "type": "bool",
     "default": true,
-    "hint": "bot 历史回复从 chat_memory 插件读取（需先安装）。关闭时回退到 AstrBot 自带 history，此时 bot_msgs_ttl 不生效。"
+    "hint": "从 chat_memory 读取近期 Bot 回复（不读取用户消息），供复读过滤和相关性唤醒使用。关闭或插件不可用时回退 AstrBot 自带 history；回退时 history_scope 和 bot_msgs_ttl 不生效。"
+  },
+  "history_scope": {
+    "description": "Bot 回复候选范围",
+    "type": "string",
+    "options": ["group", "user"],
+    "default": "group",
+    "hint": "决定候选 Bot 回复来自谁：group=当前群会话内所有用户触发的 Bot 回复，例如 Bot 回答 A 后，B 接着追问也能关联；user=只看当前发送者自己触发的 Bot 回复。不会读取用户消息，也不会自动切分整段对话。仅影响 chat_memory 数据源。"
   },
   "persona_name_prob": {
     "description": "人格名唤醒概率",
@@ -26,7 +33,7 @@
       "step": 0.01
     },
     "default": 0.5,
-    "hint": "【概率类，0=关闭】消息含当前人格名时按此概率唤醒。"
+    "hint": "【概率类，0=关闭】消息含当前实际生效人格名时按此概率唤醒；人格按 session 强制设置、当前 conversation、全局默认的顺序解析。"
   },
   "persona_name_cache_ttl": {
     "description": "人格名缓存分钟数",
@@ -93,13 +100,13 @@
       "step": 0.01
     },
     "default": 0.5,
-    "hint": "【阈值类，1=关闭】消息与 bot 最近 N 条回复的相似度（TF-IDF cosine）大于此值时唤醒。易误判可调高。"
+    "hint": "【阈值类，1=关闭】把当前用户消息分别与候选 Bot 回复计算窗口 TF-IDF cosine，取最高分；最高分大于此值时唤醒。候选范围由 history_scope、bot_msgs_maxlen 和 bot_msgs_ttl 控制。易误判可调高。"
   },
   "bot_msgs_maxlen": {
     "description": "Bot 历史条数上限",
     "type": "int",
     "default": 5,
-    "hint": "用于复读检测和相关性的 bot 回复最大条数。建议 3-10。"
+    "hint": "最多取多少条近期 Bot 回复作为候选；不包含用户消息。复读检测逐条做精确比对，相关性唤醒逐条计算后取最高分。建议 3-10。"
   },
   "bot_msgs_ttl": {
     "description": "Bot 历史过期分钟数",
@@ -116,7 +123,7 @@
       "step": 0.1
     },
     "default": 0.5,
-    "hint": "同一用户两次唤醒的最小间隔（秒），每人独立计时，CD 期内跳过所有判定。0=关闭。"
+    "hint": "同一群会话中同一用户两次智能唤醒的最小间隔（秒）。不同群、不同平台实例互不影响；CD 期内跳过 WakeLite 的所有判定。0=关闭。"
   },
   "log_config": {
     "description": "日志配置",

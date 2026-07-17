@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.2.0 — 2026-07-17
+
+### 修复
+- **人格名跟随当前实际 Persona**：改用 AstrBot `resolve_selected_persona`，按 session 强制人格 → conversation 人格 → provider 默认人格解析；保留默认人格回退
+- **相关性恢复窗口 TF-IDF**：把当前消息分别与近期 Bot 回复计算 TF-IDF cosine 并取最高分；每次基于当前候选窗口重建文档频率，不再因 IDF 状态从未更新而退化成普通词频 cosine
+- **TTL 时区安全**：优先读取 ChatMemory 的 `created_at_utc`，旧 naive 时间按 UTC 解释，不再依赖宿主机本地时区
+- **答疑语气词恢复**：`吗` 不再同时出现在停用词和提问词表；改用插件私有 jieba Tokenizer，并注册内置短语以减少分词拆散
+- **配置容错**：概率/阈值自动限制到 0-1，CD 限制到 0-10，负数条数/TTL 归零，非字符串兴趣项被安全忽略
+- **上下文标记清洗收紧**：只移除明确的 reasoning 标签，不再删除任意尖括号内容
+
+### 新增
+- **历史范围配置**：新增 `history_scope=group/user`，默认 `group`；它只控制候选 Bot 回复来自全群还是当前用户，不读取历史用户消息，也不切分对话段落
+- **会话级 CD**：冷却 key 改为 UMO + user_id，避免同一用户在不同群或平台之间互相影响
+- **运行状态清理**：定期惰性清理过期 CD 与 Persona 缓存，避免长期运行状态无限增长
+- **自动化测试**：新增 10 项测试，覆盖 Persona 解析、ChatMemory scope、UTC TTL、CD 隔离、配置容错、答疑否定与 TF-IDF 相关性
+
+### 兼容
+- ChatMemory 对接说明更新为正式版 `1.0+`
+- `metadata.yaml` 增加 AstrBot 兼容范围 `>=4.16,<5`
+- `jieba` 依赖固定为已验证的 `>=0.42.1,<0.43`
+
 ## 1.1.0 — 2026-07-11
 
 ### 修复

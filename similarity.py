@@ -1,32 +1,24 @@
 import math
 import re
-from collections import defaultdict, deque
+from collections import Counter
 
 import jieba
 
 
 class Similarity:
     """
-    话题相关性检测（TF-IDF + Cosine）。
-    - 会话隔离（按 key 分桶，调用方决定用 gid 还是 umo）
+    话题相关性检测（当前消息窗口 TF-IDF + Cosine）。
+    - 每次基于当前 user 消息与近期 bot 回复重建文档频率
     - bot 消息预处理：去噪、去重、过滤模板句
+    - 无跨会话常驻状态，不会随群/用户数量增长
     """
 
     def __init__(
         self,
-        history_limit: int = 120,
         stopwords: set[str] | None = None,
         bot_template_threshold: int = 2,
         early_stop: float = 0.92,
     ):
-        self._GROUP_DATA: dict[str, dict] = defaultdict(
-            lambda: {
-                "history": deque(maxlen=history_limit),
-                "idf": defaultdict(int),
-                "total_docs": 0,
-            }
-        )
-
         self.stopwords = stopwords or {
             "的", "了", "吗", "吧", "啊", "哦", "嗯", "恩",
             "你", "我", "他", "她", "它", "这", "那", "就", "都", "又",
@@ -70,23 +62,16 @@ class Similarity:
             cleaned.append(m)
         return cleaned
 
-    def _update_idf(self, key: str, tokens: set[str]) -> None:
-        data = self._GROUP_DATA[key]
-        for t in tokens:
-            data["idf"][t] += 1
-        data["total_docs"] += 1
-
-    def _tfidf_vector(self, key: str, tokens: list[str]) -> dict[str, float]:
-        data = self._GROUP_DATA[key]
-        total_docs = data["total_docs"] or 1
-
-        tf: dict[str, int] = defaultdict(int)
-        for t in tokens:
-            tf[t] += 1
-
+    @staticmethod
+    def _tfidf_vector(
+        tokens: list[str],
+        document_frequency: Counter[str],
+        total_docs: int,
+    ) -> dict[str, float]:
+        tf = Counter(tokens)
         vec: dict[str, float] = {}
         for t, c in tf.items():
-            idf = math.log((total_docs + 1) / (data["idf"][t] + 1)) + 1
+            idf = math.log((total_docs + 1) / (document_frequency[t] + 1)) + 1
             vec[t] = c * idf
         return vec
 
@@ -106,28 +91,40 @@ class Similarity:
         key: str,
         user_msg: str,
         bot_msgs: list[str],
-        update_history: bool = False,
     ) -> float:
+        # key 保留在公开签名中，便于调用方继续传 UMO；当前算法无跨调用状态。
+        del key
         user_tokens = self._tokenize(user_msg)
         if not user_tokens:
             return 0.0
 
-        if update_history:
-            entry = " ".join(user_tokens)
-            self._GROUP_DATA[key]["history"].append(entry)
-            self._update_idf(key, set(user_tokens))
+        bot_token_docs: list[list[str]] = []
+        for message in self._preprocess_bot_msgs(bot_msgs):
+            tokens = self._tokenize(message)
+            if tokens:
+                bot_token_docs.append(tokens)
+        if not bot_token_docs:
+            return 0.0
 
-        user_vec = self._tfidf_vector(key, user_tokens)
-
-        bot_list = self._preprocess_bot_msgs(bot_msgs)[::-1]
+        all_docs = [user_tokens, *bot_token_docs]
+        document_frequency: Counter[str] = Counter()
+        for tokens in all_docs:
+            document_frequency.update(set(tokens))
+        total_docs = len(all_docs)
+        user_vec = self._tfidf_vector(
+            user_tokens,
+            document_frequency,
+            total_docs,
+        )
 
         best = 0.0
-        for bm in bot_list:
-            bm_tokens = self._tokenize(bm)
-            if not bm_tokens:
-                continue
-            bm_vec = self._tfidf_vector(key, bm_tokens)
-            sim = self._cosine(user_vec, bm_vec)
+        for bot_tokens in reversed(bot_token_docs):
+            bot_vec = self._tfidf_vector(
+                bot_tokens,
+                document_frequency,
+                total_docs,
+            )
+            sim = self._cosine(user_vec, bot_vec)
             if sim > best:
                 best = sim
             if sim >= self.early_stop:

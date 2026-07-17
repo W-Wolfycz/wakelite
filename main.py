@@ -3,7 +3,7 @@ import json
 import random
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent
@@ -15,7 +15,22 @@ from .sentiment import sentiment
 from .similarity import Similarity
 
 
-_CTX_CLEAN_RE = re.compile(r"<[^>]+>")
+_CTX_CLEAN_RE = re.compile(r"</?(?:think|reasoning|analysis)>", re.IGNORECASE)
+
+
+def _clamp_float(value, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
+def _nonnegative_int(value, default: int) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
 
 
 class WakeLitePlugin(Star):
@@ -25,31 +40,56 @@ class WakeLitePlugin(Star):
         super().__init__(context)
         self.config = config
 
-        self.persona_name_prob = float(config.get("persona_name_prob", 0.5))
-        self.prob = float(config.get("prob", 0.0))
-        self.ask_threshold = float(config.get("ask_threshold", 0.5))
-        self.bored_threshold = float(config.get("bored_threshold", 0.5))
-        self.interest_threshold = float(config.get("interest_threshold", 0.5))
-        self.similar_threshold = float(config.get("similar_threshold", 0.5))
-        self.bot_msgs_maxlen = int(config.get("bot_msgs_maxlen", 5))
-        # 配置单位为分钟，内部统一转秒
-        self.bot_msgs_ttl = int(config.get("bot_msgs_ttl", 10)) * 60
-        self.persona_name_cache_ttl = int(config.get("persona_name_cache_ttl", 1)) * 60
-        self.wake_cd = float(config.get("wake_cd", 0.5))
-        self.use_chat_memory = bool(config.get("use_chat_memory", True))
-        self.whitelist_groups: set[str] = set(
-            str(g) for g in config.get("whitelist_groups", [])
+        self.persona_name_prob = _clamp_float(
+            config.get("persona_name_prob", 0.5), 0.5, 0.0, 1.0
         )
-        interest_words_str = config.get("interest_words", [])
+        self.prob = _clamp_float(config.get("prob", 0.0), 0.0, 0.0, 1.0)
+        self.ask_threshold = _clamp_float(
+            config.get("ask_threshold", 0.5), 0.5, 0.0, 1.0
+        )
+        self.bored_threshold = _clamp_float(
+            config.get("bored_threshold", 0.5), 0.5, 0.0, 1.0
+        )
+        self.interest_threshold = _clamp_float(
+            config.get("interest_threshold", 0.5), 0.5, 0.0, 1.0
+        )
+        self.similar_threshold = _clamp_float(
+            config.get("similar_threshold", 0.5), 0.5, 0.0, 1.0
+        )
+        self.bot_msgs_maxlen = _nonnegative_int(config.get("bot_msgs_maxlen", 5), 5)
+        # 配置单位为分钟，内部统一转秒
+        self.bot_msgs_ttl = _nonnegative_int(config.get("bot_msgs_ttl", 10), 10) * 60
+        self.persona_name_cache_ttl = _nonnegative_int(
+            config.get("persona_name_cache_ttl", 1), 1
+        ) * 60
+        self.wake_cd = _clamp_float(config.get("wake_cd", 0.5), 0.5, 0.0, 10.0)
+        self.use_chat_memory = bool(config.get("use_chat_memory", True))
+        history_scope = str(config.get("history_scope", "group") or "group").strip().lower()
+        self.history_scope = history_scope if history_scope in {"user", "group"} else "group"
+        whitelist_groups = config.get("whitelist_groups", []) or []
+        if not isinstance(whitelist_groups, (list, tuple, set)):
+            whitelist_groups = []
+        self.whitelist_groups: set[str] = set(
+            str(g) for g in whitelist_groups
+        )
+        interest_words_str = config.get("interest_words", []) or []
+        if not isinstance(interest_words_str, (list, tuple)):
+            interest_words_str = []
         self.interest_words: list[list[str]] = [
-            [w for w in s.split() if w] for s in interest_words_str
+            [w for w in s.split() if w]
+            for s in interest_words_str
+            if isinstance(s, str)
         ]
         # 多 bot 分流：每项 "platform_id:self_id" 字符串
         log_conf = config.get("log_config", {}) or {}
+        if not isinstance(log_conf, dict):
+            log_conf = {}
         self.log_with_bot_id = bool(log_conf.get("log_with_bot_id", True))
         self.debug_to_info = bool(log_conf.get("debug_to_info", False))
 
         bots_raw = config.get("bots", []) or []
+        if not isinstance(bots_raw, (list, tuple)):
+            bots_raw = []
         self.bots: list[tuple[str, str]] = []
         self.bots_index: dict[tuple[str, str], int] = {}
         for entry in bots_raw:
@@ -64,6 +104,9 @@ class WakeLitePlugin(Star):
             pid, sid = s.split(":", 1)
             pid, sid = pid.strip(), sid.strip()
             if not (pid and sid):
+                logger.warning(
+                    f"{self._log_prefix()} bots 配置项字段不能为空：{s}"
+                )
                 continue
             key = (pid, sid)
             if key in self.bots_index:
@@ -78,8 +121,9 @@ class WakeLitePlugin(Star):
 
         # umo -> (name, timestamp)
         self._persona_name_cache: dict[str, tuple[str, float]] = {}
-        # uid -> last wake timestamp
-        self._last_wake: dict[str, float] = {}
+        # (UMO, user_id) -> last wake timestamp，避免跨群/跨平台互相影响
+        self._last_wake: dict[tuple[str, str], float] = {}
+        self._runtime_ops = 0
 
         logger.info(
             f"{self._log_prefix()} 已加载：人格名={self.persona_name_prob}, "
@@ -90,6 +134,7 @@ class WakeLitePlugin(Star):
             f"兴趣关键词包={len(self.interest_words)}个, "
             f"分流bots={len(self.bots)}个, "
             f"使用chat_memory={self.use_chat_memory}, "
+            f"历史范围={self.history_scope}, "
             f"日志区分bot={self.log_with_bot_id}, "
             f"调试提级={self.debug_to_info}"
         )
@@ -101,15 +146,51 @@ class WakeLitePlugin(Star):
     ) -> str | None:
         cached = self._persona_name_cache.get(umo)
         now = time.time()
-        if cached and now - cached[1] < self.persona_name_cache_ttl:
+        if (
+            self.persona_name_cache_ttl > 0
+            and cached
+            and now - cached[1] < self.persona_name_cache_ttl
+        ):
             return cached[0]
+        persona = None
         try:
-            persona = await self.persona_mgr.get_default_persona_v3(umo)
+            conversation_persona_id = None
+            try:
+                conv_id = await self.conv_mgr.get_curr_conversation_id(umo) or ""
+                if conv_id:
+                    conversation = await self.conv_mgr.get_conversation(umo, conv_id)
+                    conversation_persona_id = getattr(conversation, "persona_id", None)
+            except Exception as e:
+                self._log(f"读取 conversation persona 失败 umo={umo}: {e}", event=event)
+
+            provider_settings = {}
+            try:
+                runtime_config = self.context.get_config(umo=umo) or {}
+                provider_settings = runtime_config.get("provider_settings", {}) or {}
+            except Exception:
+                provider_settings = {}
+
+            resolved, persona, _, _ = await self.persona_mgr.resolve_selected_persona(
+                umo=umo,
+                conversation_persona_id=conversation_persona_id,
+                platform_name=event.get_platform_name() if event else "",
+                provider_settings=provider_settings,
+            )
+            if persona is None and resolved and resolved != "[%None]":
+                getter = getattr(self.persona_mgr, "get_persona_v3_by_id", None)
+                if getter is not None:
+                    persona = getter(resolved)
         except Exception as e:
             logger.warning(f"{self._log_prefix(event)} 获取人格失败 umo={umo}: {e}")
-            return None
-        name = persona.get("name") if persona else None
-        if name:
+            try:
+                persona = await self.persona_mgr.get_default_persona_v3(umo)
+            except Exception:
+                return None
+        if isinstance(persona, dict):
+            name = persona.get("name")
+        else:
+            name = getattr(persona, "name", None) if persona else None
+        if name and self.persona_name_cache_ttl > 0:
             self._persona_name_cache[umo] = (name, now)
             self._log(f"人格名缓存更新 umo={umo} name={name}", event=event)
         return name
@@ -152,7 +233,9 @@ class WakeLitePlugin(Star):
                 continue
             # TTL 过滤（best-effort，仅 chat_memory 有 created_at）
             if self.bot_msgs_ttl > 0:
-                ts = self._parse_created_at(r.get("created_at"))
+                ts = self._parse_created_at(
+                    r.get("created_at_utc") or r.get("created_at")
+                )
                 if ts is not None and now - ts > self.bot_msgs_ttl:
                     continue
             reread_msgs.append(content)
@@ -178,8 +261,11 @@ class WakeLitePlugin(Star):
             return []
         try:
             limit = max(self.bot_msgs_maxlen, 5)
+            user_filter = uid if self.history_scope == "user" else None
             return await query(
-                umo, conv_id, uid,
+                umo,
+                conv_id,
+                user_filter,
                 limit=limit,
                 role_filter="assistant",
             )
@@ -219,7 +305,12 @@ class WakeLitePlugin(Star):
         except (TypeError, ValueError):
             pass
         try:
-            return datetime.fromisoformat(str(value)).timestamp()
+            text = str(value).strip().replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                # chat_memory 的数据库时间统一为 UTC naive；不依赖宿主机本地时区。
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
         except (TypeError, ValueError):
             return None
 
@@ -267,8 +358,27 @@ class WakeLitePlugin(Star):
 
     def _wake(self, event: AstrMessageEvent, uid: str, now: float, reason: str) -> None:
         event.is_at_or_wake_command = True
-        self._last_wake[uid] = now
+        self._last_wake[(event.unified_msg_origin, uid)] = now
         logger.info(f"{self._log_prefix(event)} {reason}")
+
+    def _maintain_runtime_state(self, now: float) -> None:
+        """惰性清理长期运行状态，避免用户/会话数量无限增长。"""
+        self._runtime_ops += 1
+        if self._runtime_ops % 256:
+            return
+        wake_cutoff = now - max(self.wake_cd * 2, 300.0)
+        self._last_wake = {
+            key: ts for key, ts in self._last_wake.items() if ts >= wake_cutoff
+        }
+        if self.persona_name_cache_ttl <= 0:
+            self._persona_name_cache.clear()
+        else:
+            cache_cutoff = now - self.persona_name_cache_ttl
+            self._persona_name_cache = {
+                key: value
+                for key, value in self._persona_name_cache.items()
+                if value[1] >= cache_cutoff
+            }
 
     # ===================== 多 bot 分流 =====================
 
@@ -343,10 +453,11 @@ class WakeLitePlugin(Star):
             return
 
         now = time.time()
+        self._maintain_runtime_state(now)
 
         # 唤醒 CD（每用户独立）
         if self.wake_cd > 0:
-            last = self._last_wake.get(uid, 0.0)
+            last = self._last_wake.get((umo, uid), 0.0)
             if now - last < self.wake_cd:
                 self._log(
                     f"唤醒CD中 uid={uid} 剩余{self.wake_cd - (now - last):.2f}s",
