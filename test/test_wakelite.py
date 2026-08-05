@@ -29,6 +29,13 @@ def _install_astrbot_stubs() -> None:
 
             return decorator
 
+        @staticmethod
+        def on_llm_request(*args, **kwargs):
+            def decorator(func):
+                return func
+
+            return decorator
+
     class Star:
         def __init__(self, context):
             self.context = context
@@ -41,8 +48,11 @@ def _install_astrbot_stubs() -> None:
         "astrbot": types.ModuleType("astrbot"),
         "astrbot.api": types.ModuleType("astrbot.api"),
         "astrbot.api.event": types.ModuleType("astrbot.api.event"),
+        "astrbot.api.provider": types.ModuleType("astrbot.api.provider"),
         "astrbot.api.star": types.ModuleType("astrbot.api.star"),
         "astrbot.core": types.ModuleType("astrbot.core"),
+        "astrbot.core.agent": types.ModuleType("astrbot.core.agent"),
+        "astrbot.core.agent.message": types.ModuleType("astrbot.core.agent.message"),
         "astrbot.core.message": types.ModuleType("astrbot.core.message"),
         "astrbot.core.message.components": types.ModuleType(
             "astrbot.core.message.components"
@@ -52,8 +62,19 @@ def _install_astrbot_stubs() -> None:
     modules["astrbot.api"].AstrBotConfig = dict
     modules["astrbot.api.event"].filter = Filter()
     modules["astrbot.api.event"].AstrMessageEvent = object
+    modules["astrbot.api.provider"].ProviderRequest = object
     modules["astrbot.api.star"].Context = object
     modules["astrbot.api.star"].Star = Star
+    class TextPart:
+        def __init__(self, text=""):
+            self.text = text
+            self._no_save = False
+
+        def mark_as_temp(self):
+            self._no_save = True
+            return self
+
+    modules["astrbot.core.agent.message"].TextPart = TextPart
     modules["astrbot.core.message.components"].Plain = Plain
     sys.modules.update(modules)
 
@@ -100,6 +121,11 @@ class QueryRecorder:
     async def query_history(self, *args, **kwargs):
         self.args = (args, kwargs)
         return []
+
+
+class ProviderRequest:
+    def __init__(self):
+        self.extra_user_content_parts = []
 
 
 class Context:
@@ -192,7 +218,58 @@ class DomainTests(unittest.TestCase):
         )
 
 
-class IntegrationAdapterTests(unittest.IsolatedAsyncioTestCase):
+class WakeHintTests(unittest.IsolatedAsyncioTestCase):
+    async def test_non_conversation_wake_adds_temporary_hint(self):
+        plugin = make_plugin()
+        event = Event()
+        plugin._wake(event, "10002", 123.0, "概率唤醒", source="probability")
+        req = ProviderRequest()
+
+        await plugin.inject_wake_hint(event, req)
+
+        self.assertEqual(len(req.extra_user_content_parts), 1)
+        part = req.extra_user_content_parts[0]
+        self.assertTrue(part._no_save)
+        self.assertIn("概率信号被唤醒", part.text)
+        self.assertIn("不是历史对话的自然续接", part.text)
+        self.assertIn("其他用户带有鲜明人物设定", part.text)
+        self.assertIn("不要模仿、接管或延续", part.text)
+
+    async def test_all_wake_sources_add_hint(self):
+        plugin = make_plugin()
+        for source in ("persona_name", "ask", "bored", "interest", "similarity"):
+            event = Event()
+            plugin._wake(event, "10002", 123.0, source, source=source)
+            req = ProviderRequest()
+
+            await plugin.inject_wake_hint(event, req)
+
+            self.assertEqual(len(req.extra_user_content_parts), 1, source)
+
+    async def test_non_wake_event_does_not_add_hint(self):
+        plugin = make_plugin()
+        event = Event()
+        req = ProviderRequest()
+
+        await plugin.inject_wake_hint(event, req)
+
+        self.assertEqual(req.extra_user_content_parts, [])
+
+    async def test_hint_keeps_existing_extra_parts(self):
+        plugin = make_plugin()
+        event = Event()
+        plugin._wake(event, "10002", 123.0, "兴趣唤醒", source="interest")
+        existing = object()
+        req = ProviderRequest()
+        req.extra_user_content_parts.append(existing)
+
+        await plugin.inject_wake_hint(event, req)
+
+        self.assertIs(req.extra_user_content_parts[0], existing)
+        self.assertEqual(len(req.extra_user_content_parts), 2)
+
+
+class AdapterLogicTests(unittest.IsolatedAsyncioTestCase):
     async def test_persona_name_uses_resolved_conversation_persona(self):
         plugin = make_plugin(persona_name_cache_ttl=0)
         name = await plugin._get_persona_name(Event.unified_msg_origin, Event())

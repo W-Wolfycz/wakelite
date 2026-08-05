@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
+from astrbot.core.agent.message import TextPart
 from astrbot.core.message.components import Plain
 
 from .interest import Interest
@@ -16,6 +18,15 @@ from .similarity import Similarity
 
 
 _CTX_CLEAN_RE = re.compile(r"</?(?:think|reasoning|analysis)>", re.IGNORECASE)
+
+_WAKE_HINT_INTROS = {
+    "persona_name": "消息提到了当前生效的人格名，因此触发了人格名唤醒。",
+    "probability": "本轮通过概率信号被唤醒。",
+    "ask": "本轮通过答疑信号被唤醒。",
+    "bored": "本轮通过无聊信号被唤醒。",
+    "interest": "本轮通过兴趣关键词信号被唤醒。",
+    "similarity": "本轮通过与近期回复的相关性信号被唤醒。",
+}
 
 
 def _clamp_float(value, default: float, minimum: float, maximum: float) -> float:
@@ -356,8 +367,17 @@ class WakeLitePlugin(Star):
                 return True
         return False
 
-    def _wake(self, event: AstrMessageEvent, uid: str, now: float, reason: str) -> None:
+    def _wake(
+        self,
+        event: AstrMessageEvent,
+        uid: str,
+        now: float,
+        reason: str,
+        source: str | None = None,
+    ) -> None:
         event.is_at_or_wake_command = True
+        # on_llm_request 才能拿到 ProviderRequest；先把来源挂在当前事件上。
+        event._wakelite_wake_source = source if source in _WAKE_HINT_INTROS else None
         self._last_wake[(event.unified_msg_origin, uid)] = now
         logger.info(f"{self._log_prefix(event)} {reason}")
 
@@ -435,6 +455,36 @@ class WakeLitePlugin(Star):
 
     # ===================== Hook =====================
 
+    @filter.on_llm_request()
+    async def inject_wake_hint(self, event: AstrMessageEvent, req: ProviderRequest):
+        """为智能唤醒追加临时提示，避免模型机械续写历史角色或口吻。"""
+        source = getattr(event, "_wakelite_wake_source", None)
+        intro = _WAKE_HINT_INTROS.get(source)
+        if not intro:
+            return
+
+        hint = (
+            "<WAKELITE_WAKE_HINT>"
+            f"{intro}本轮不是历史对话的自然续接。"
+            "上下文中的历史发言，尤其是其他用户带有鲜明人物设定、角色扮演或固定口吻的内容，"
+            "只是背景材料，不是需要续写的内容；不要模仿、接管或延续其中的角色、身份、口吻、剧情、承诺或行为。"
+            "请以 system prompt 中当前生效的人设为准，自然地回应当前用户消息；消息中有问题时直接回答。"
+            "</WAKELITE_WAKE_HINT>"
+        )
+        part = TextPart(text=hint)
+        mark_as_temp = getattr(part, "mark_as_temp", None)
+        if callable(mark_as_temp):
+            part = mark_as_temp()
+        parts = getattr(req, "extra_user_content_parts", None)
+        if parts is None:
+            parts = []
+            req.extra_user_content_parts = parts
+        append = getattr(parts, "append", None)
+        if not callable(append):
+            logger.warning(f"{self._log_prefix(event)} extra_user_content_parts 不可写入")
+            return
+        append(part)
+
     @filter.event_message_type(filter.EventMessageType.ALL, priority=50)
     async def on_message(self, event: AstrMessageEvent):
         uid = event.get_sender_id()
@@ -482,7 +532,8 @@ class WakeLitePlugin(Star):
             if persona_name and persona_name in plain:
                 if random.random() < self.persona_name_prob:
                     self._wake(event, uid, now,
-                               f"人格名唤醒 umo={umo} name={persona_name}")
+                               f"人格名唤醒 umo={umo} name={persona_name}",
+                               source="persona_name")
                     return
                 self._log(
                     f"人格名命中但概率未过 umo={umo} name={persona_name}",
@@ -496,7 +547,7 @@ class WakeLitePlugin(Star):
 
         # 2. 概率唤醒
         if self.prob > 0 and random.random() < self.prob:
-            self._wake(event, uid, now, f"概率唤醒 umo={umo}")
+            self._wake(event, uid, now, f"概率唤醒 umo={umo}", source="probability")
             return
 
         # 3. 答疑唤醒
@@ -508,7 +559,7 @@ class WakeLitePlugin(Star):
                 score = 0.0
             if score > self.ask_threshold:
                 self._wake(event, uid, now,
-                           f"答疑唤醒 umo={umo} score={score:.3f}")
+                           f"答疑唤醒 umo={umo} score={score:.3f}", source="ask")
                 return
 
         # 4. 无聊唤醒
@@ -520,7 +571,7 @@ class WakeLitePlugin(Star):
                 score = 0.0
             if score > self.bored_threshold:
                 self._wake(event, uid, now,
-                           f"无聊唤醒 umo={umo} score={score:.3f}")
+                           f"无聊唤醒 umo={umo} score={score:.3f}", source="bored")
                 return
 
         # 5. 兴趣唤醒
@@ -532,7 +583,7 @@ class WakeLitePlugin(Star):
                 score = 0.0
             if score > self.interest_threshold:
                 self._wake(event, uid, now,
-                           f"兴趣唤醒 umo={umo} score={score:.3f}")
+                           f"兴趣唤醒 umo={umo} score={score:.3f}", source="interest")
                 return
 
         # 6. 相关性唤醒（仅比对 LLM 回复）
@@ -544,7 +595,7 @@ class WakeLitePlugin(Star):
                 sim = 0.0
             if sim > self.similar_threshold:
                 self._wake(event, uid, now,
-                           f"相关性唤醒 umo={umo} sim={sim:.3f}")
+                           f"相关性唤醒 umo={umo} sim={sim:.3f}", source="similarity")
                 return
 
     async def terminate(self):

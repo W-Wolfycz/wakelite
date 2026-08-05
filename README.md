@@ -17,6 +17,8 @@ AstrBot 的轻量唤醒插件。在群聊场景下决定 bot 要不要对一条�
 | 5 | 兴趣 | 命中自定义关键词包，加权分数 > 阈值 | `interest_words` + `interest_threshold` |
 | 6 | 相关性 | 消息与 bot 最近 N 条回复 TF-IDF cosine > 阈值 | `similar_threshold` |
 
+六类智能唤醒都会在本轮 `extra_user_content_parts` 中追加临时提示。提示明确：历史中的其他用户发言，即使带有鲜明人物设定或固定口吻，也只是背景材料，不应被模仿或续写；模型应以当前生效的人设自然回应当前消息。该提示不会写入对话历史。
+
 **配置项语义分两类**：
 - **【概率类】**（`persona_name_prob` / `prob`）：`0=关闭`，越大越易唤醒，范围 0-1
 - **【阈值类】**（`ask/bored/interest/similar_threshold`）：`1=关闭`，越大越严，范围 0-1
