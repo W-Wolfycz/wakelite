@@ -1,7 +1,12 @@
+import dataclasses
+import json
 import sys
+import time
 import types
 import unittest
 from datetime import datetime, timezone
+
+import jieba
 
 
 def _install_astrbot_stubs() -> None:
@@ -36,6 +41,13 @@ def _install_astrbot_stubs() -> None:
 
             return decorator
 
+        @staticmethod
+        def on_decorating_result(*args, **kwargs):
+            def decorator(func):
+                return func
+
+            return decorator
+
     class Star:
         def __init__(self, context):
             self.context = context
@@ -65,6 +77,31 @@ def _install_astrbot_stubs() -> None:
     modules["astrbot.api.provider"].ProviderRequest = object
     modules["astrbot.api.star"].Context = object
     modules["astrbot.api.star"].Star = Star
+
+    @dataclasses.dataclass
+    class FunctionTool:
+        name: str
+        description: str = ""
+        parameters: dict = dataclasses.field(default_factory=dict)
+        handler: object = None
+        active: bool = True
+
+    class ToolSet:
+        def __init__(self):
+            self.tools = []
+
+        def add_tool(self, tool):
+            self.tools.append(tool)
+
+        def names(self):
+            return [tool.name for tool in self.tools]
+
+        def __bool__(self):
+            return bool(self.tools)
+
+    modules["astrbot.api"].FunctionTool = FunctionTool
+    modules["astrbot.api"].ToolSet = ToolSet
+
     class TextPart:
         def __init__(self, text=""):
             self.text = text
@@ -81,6 +118,7 @@ def _install_astrbot_stubs() -> None:
 
 _install_astrbot_stubs()
 
+from astrbot.api import FunctionTool, ToolSet
 from wakelite.main import WakeLitePlugin
 from wakelite.sentiment import sentiment
 from wakelite.similarity import Similarity
@@ -102,9 +140,11 @@ class ConversationManager:
 class PersonaManager:
     def __init__(self):
         self.resolve_kwargs = None
+        self.resolve_count = 0
 
     async def resolve_selected_persona(self, **kwargs):
         self.resolve_kwargs = kwargs
+        self.resolve_count += 1
         return "persona_conversation", {"name": "会话人格"}, None, False
 
     def get_persona_v3_by_id(self, persona_id):
@@ -117,15 +157,17 @@ class PersonaManager:
 class QueryRecorder:
     def __init__(self):
         self.args = None
+        self.records = []
 
     async def query_history(self, *args, **kwargs):
         self.args = (args, kwargs)
-        return []
+        return self.records
 
 
 class ProviderRequest:
     def __init__(self):
         self.extra_user_content_parts = []
+        self.func_tool = None
 
 
 class Context:
@@ -147,11 +189,78 @@ class Event:
     unified_msg_origin = "platform_demo:GroupMessage:group_demo"
     is_at_or_wake_command = False
 
+    def __init__(self):
+        self._extras = {}
+        self._result = None
+        self._force_stopped = False
+        self.message_str = "用户消息"
+        self.group_id = "group_demo"
+        self.sender_id = "10002"
+        self.self_id = "10001"
+
     def get_platform_name(self):
         return "aiocqhttp"
 
     def get_self_id(self):
-        return "10001"
+        return self.self_id
+
+    def get_sender_id(self):
+        return self.sender_id
+
+    def get_group_id(self):
+        return self.group_id
+
+    def get_messages(self):
+        return []
+
+    def set_extra(self, key, value):
+        self._extras[key] = value
+
+    def get_extra(self, key=None, default=None):
+        if key is None:
+            return self._extras
+        return self._extras.get(key, default)
+
+    def set_result(self, result):
+        self._result = result
+
+    def get_result(self):
+        return self._result
+
+    def clear_result(self):
+        self._result = None
+
+    def stop_event(self):
+        self._force_stopped = True
+
+    def is_stopped(self):
+        return self._force_stopped
+
+
+class FakeConfig(dict):
+    """模拟支持写回的 AstrBotConfig（异步 save_config_async）。"""
+
+    def __init__(self, data):
+        super().__init__(data)
+        self.save_count = 0
+        self.saved = None
+
+    async def save_config_async(self):
+        self.save_count += 1
+        self.saved = dict(self)
+
+
+class SyncSaveConfig(dict):
+    """模拟仅提供同步 save_config 的 config 对象。"""
+
+    def __init__(self, data):
+        super().__init__(data)
+        self.save_count = 0
+        self.saved = None
+
+    def save_config(self):
+        self.save_count += 1
+        self.saved = dict(self)
 
 
 def make_plugin(**overrides):
@@ -195,13 +304,15 @@ class DomainTests(unittest.TestCase):
             ask_threshold=-1,
             wake_cd=99,
             bot_msgs_maxlen=-5,
-            bot_msgs_ttl=-10,
         )
         self.assertEqual(plugin.prob, 1.0)
         self.assertEqual(plugin.ask_threshold, 0.0)
         self.assertEqual(plugin.wake_cd, 10.0)
         self.assertEqual(plugin.bot_msgs_maxlen, 0)
-        self.assertEqual(plugin.bot_msgs_ttl, 0)
+
+    def test_history_limit_capped_at_maximum(self):
+        plugin = make_plugin(bot_msgs_maxlen=999)
+        self.assertEqual(plugin.bot_msgs_maxlen, 50)
 
     def test_created_at_utc_is_timezone_safe(self):
         actual = WakeLitePlugin._parse_created_at("2026-07-17T12:00:00Z")
@@ -216,6 +327,108 @@ class DomainTests(unittest.TestCase):
             plugin._last_wake[(event.unified_msg_origin, "10002")],
             123.0,
         )
+
+
+class SimilarityTimeDecayTests(unittest.TestCase):
+    MSG = "原神角色怎么配队"
+    CAND = ["原神角色配队需要考虑元素反应"]
+
+    def test_decay_lowers_older_candidate_score(self):
+        s = Similarity(bot_template_threshold=0)
+        fresh = s.similarity("k", self.MSG, self.CAND, ages=[0.0])
+        old = s.similarity("k", self.MSG, self.CAND, ages=[600.0])
+        self.assertGreater(fresh, old)
+
+    def test_no_ages_matches_undecayed(self):
+        s = Similarity(bot_template_threshold=0)
+        with_ages = s.similarity("k", self.MSG, self.CAND, ages=[0.0])
+        no_ages = s.similarity("k", self.MSG, self.CAND)
+        self.assertAlmostEqual(with_ages, no_ages)
+
+    def test_unknown_age_not_decayed(self):
+        s = Similarity(bot_template_threshold=0)
+        a = s.similarity("k", self.MSG, self.CAND, ages=[None])
+        b = s.similarity("k", self.MSG, self.CAND, ages=[0.0])
+        self.assertAlmostEqual(a, b)
+
+    def test_token_cache_reuses_tokens(self):
+        s = Similarity(bot_template_threshold=0)
+        calls = {"n": 0}
+        real_lcut = jieba.lcut
+
+        def counting(text):
+            calls["n"] += 1
+            return real_lcut(text)
+
+        jieba.lcut = counting
+        try:
+            s.similarity("k", self.MSG, self.CAND)
+            first = calls["n"]
+            s.similarity("k", self.MSG, self.CAND)
+            self.assertEqual(calls["n"], first)  # 第二次全部命中缓存
+        finally:
+            jieba.lcut = real_lcut
+
+
+class CandidateWindowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_candidates_capped_by_history_limit(self):
+        now = time.time()
+        records = [
+            {
+                "role": "assistant",
+                "content": f"回复内容 {i}",
+                "llm_status": "llm_success",
+                "created_at_utc": now - (9 - i) * 60,
+            }
+            for i in range(10)
+        ]
+        plugin = make_plugin(bot_msgs_maxlen=3)
+        plugin.context.query_recorder.records = records
+
+        reread, sims, ages = await plugin._get_bot_msgs("umo_demo", "10002")
+
+        self.assertEqual(len(reread), 3)
+        self.assertEqual(len(sims), 3)
+        self.assertEqual(len(ages), 3)
+        self.assertTrue(all(a is not None for a in ages))
+        self.assertLess(ages[-1], ages[0])  # 旧→新，年龄递减
+
+    async def test_no_ttl_hard_drop_old_records_kept_within_limit(self):
+        now = time.time()
+        records = [
+            {
+                "role": "assistant",
+                "content": f"很久之前的回复 {i}",
+                "llm_status": "llm_success",
+                "created_at_utc": now - 3600 - i * 60,
+            }
+            for i in range(10)
+        ]
+        plugin = make_plugin(bot_msgs_maxlen=10)
+        plugin.context.query_recorder.records = records
+
+        reread, sims, ages = await plugin._get_bot_msgs("umo_demo", "10002")
+
+        # 取消过期时间后，超过旧 TTL（10 分钟）的记录不再被硬丢弃，
+        # 只受条数上限约束，旧记录靠时间衰减压低权重。
+        self.assertEqual(len(sims), 10)
+        self.assertTrue(all(a is not None and a > 3600 for a in ages))
+
+    async def test_fallback_source_ages_are_none(self):
+        plugin = make_plugin(use_chat_memory=False, bot_msgs_maxlen=5)
+        Conversation.history = json.dumps(
+            [
+                {"role": "assistant", "content": "兜底回复内容一二"},
+                {"role": "user", "content": "用户消息"},
+            ]
+        )
+        try:
+            reread, sims, ages = await plugin._get_bot_msgs("umo_demo", "10002")
+        finally:
+            Conversation.history = "[]"
+
+        self.assertEqual(len(sims), 1)
+        self.assertEqual(ages, [None])
 
 
 class WakeHintTests(unittest.IsolatedAsyncioTestCase):
@@ -268,15 +481,191 @@ class WakeHintTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(req.extra_user_content_parts[0], existing)
         self.assertEqual(len(req.extra_user_content_parts), 2)
 
+    async def test_reject_guide_added_to_hint_when_tool_enabled(self):
+        plugin = make_plugin(enable_reject_tool=True)
+        event = Event()
+        plugin._wake(event, "10002", 123.0, "答疑唤醒", source="ask")
+        req = ProviderRequest()
+
+        await plugin.inject_wake_hint(event, req)
+
+        self.assertIn("wakelite_decline_reply", req.extra_user_content_parts[0].text)
+
+    async def test_no_reject_guide_when_tool_disabled(self):
+        plugin = make_plugin(enable_reject_tool=False)
+        event = Event()
+        plugin._wake(event, "10002", 123.0, "答疑唤醒", source="ask")
+        req = ProviderRequest()
+
+        await plugin.inject_wake_hint(event, req)
+
+        self.assertNotIn("wakelite_decline_reply", req.extra_user_content_parts[0].text)
+
+
+class OnMessageTests(unittest.IsolatedAsyncioTestCase):
+    """覆盖插件类入口 on_message 的事件分支（AGENTS.md：不能只测被调函数）。"""
+
+    @staticmethod
+    def _quiet_plugin(**overrides):
+        defaults = dict(
+            prob=0,
+            persona_name_prob=0,
+            ask_threshold=1,
+            bored_threshold=1,
+            interest_threshold=1,
+            similar_threshold=1,
+            wake_cd=0,
+        )
+        defaults.update(overrides)
+        return make_plugin(**defaults)
+
+    async def test_non_whitelist_group_skipped(self):
+        plugin = self._quiet_plugin()
+        event = Event()
+        event.group_id = "other_group"
+
+        await plugin.on_message(event)
+
+        self.assertFalse(event.is_at_or_wake_command)
+
+    async def test_bot_self_message_skipped(self):
+        plugin = self._quiet_plugin()
+        event = Event()
+        event.sender_id = event.self_id
+
+        await plugin.on_message(event)
+
+        self.assertFalse(event.is_at_or_wake_command)
+
+    async def test_wake_cd_blocks_second_message(self):
+        plugin = self._quiet_plugin(wake_cd=5.0)
+        event = Event()
+        plugin._last_wake[(event.unified_msg_origin, event.sender_id)] = time.time()
+
+        await plugin.on_message(event)
+
+        self.assertFalse(event.is_at_or_wake_command)
+
+    async def test_probability_wake_sets_flag(self):
+        plugin = self._quiet_plugin(prob=1.0)
+        event = Event()
+
+        await plugin.on_message(event)
+
+        self.assertTrue(event.is_at_or_wake_command)
+        self.assertEqual(event._wakelite_wake_source, "probability")
+
+    async def test_persona_name_wake_sets_flag(self):
+        plugin = self._quiet_plugin(persona_name_prob=1.0)
+        event = Event()
+        event.message_str = "会话人格你好"
+
+        await plugin.on_message(event)
+
+        self.assertTrue(event.is_at_or_wake_command)
+        self.assertEqual(event._wakelite_wake_source, "persona_name")
+
+
+class RejectToolTests(unittest.IsolatedAsyncioTestCase):
+    def test_reject_tool_disabled_by_default(self):
+        self.assertFalse(make_plugin().enable_reject_tool)
+
+    async def test_tool_injected_when_woken_and_enabled(self):
+        plugin = make_plugin(enable_reject_tool=True)
+        event = Event()
+        plugin._wake(event, "10002", 123.0, "答疑唤醒", source="ask")
+        req = ProviderRequest()
+
+        await plugin.inject_wake_hint(event, req)
+
+        self.assertIsNotNone(req.func_tool)
+        self.assertIn("wakelite_decline_reply", req.func_tool.names())
+
+    async def test_tool_not_injected_without_wake(self):
+        plugin = make_plugin(enable_reject_tool=True)
+        req = ProviderRequest()
+
+        await plugin.inject_wake_hint(Event(), req)
+
+        self.assertIsNone(req.func_tool)
+
+    async def test_tool_not_injected_when_disabled(self):
+        plugin = make_plugin(enable_reject_tool=False)
+        event = Event()
+        plugin._wake(event, "10002", 123.0, "答疑唤醒", source="ask")
+        req = ProviderRequest()
+
+        await plugin.inject_wake_hint(event, req)
+
+        self.assertIsNone(req.func_tool)
+
+    async def test_injection_preserves_existing_tools(self):
+        plugin = make_plugin(enable_reject_tool=True)
+        event = Event()
+        plugin._wake(event, "10002", 123.0, "答疑唤醒", source="ask")
+        req = ProviderRequest()
+        req.func_tool = ToolSet()
+        req.func_tool.add_tool(
+            FunctionTool(name="other_tool", parameters={"type": "object", "properties": {}})
+        )
+
+        await plugin.inject_wake_hint(event, req)
+
+        names = req.func_tool.names()
+        self.assertIn("other_tool", names)
+        self.assertIn("wakelite_decline_reply", names)
+
+    async def test_decline_handler_marks_event(self):
+        plugin = make_plugin()
+        event = Event()
+
+        result = await plugin._decline_reply_handler(event)
+
+        self.assertTrue(event.get_extra("wakelite_declined", False))
+        self.assertIsInstance(result, str)
+
+    async def test_block_clears_result_when_declined(self):
+        plugin = make_plugin()
+        event = Event()
+        event.set_result("dummy")
+        event.set_extra("wakelite_declined", True)
+
+        await plugin.block_declined_reply(event)
+
+        self.assertIsNone(event.get_result())
+        self.assertTrue(event.is_stopped())
+
+    async def test_block_untouched_when_not_declined(self):
+        plugin = make_plugin()
+        event = Event()
+        event.set_result("dummy")
+
+        await plugin.block_declined_reply(event)
+
+        self.assertEqual(event.get_result(), "dummy")
+        self.assertFalse(event.is_stopped())
+
 
 class AdapterLogicTests(unittest.IsolatedAsyncioTestCase):
     async def test_persona_name_uses_resolved_conversation_persona(self):
-        plugin = make_plugin(persona_name_cache_ttl=0)
+        plugin = make_plugin()
         name = await plugin._get_persona_name(Event.unified_msg_origin, Event())
         self.assertEqual(name, "会话人格")
         kwargs = plugin.persona_mgr.resolve_kwargs
         self.assertEqual(kwargs["conversation_persona_id"], "persona_conversation")
         self.assertEqual(kwargs["platform_name"], "aiocqhttp")
+
+    async def test_persona_name_queried_every_call_without_plugin_cache(self):
+        plugin = make_plugin()
+        for _ in range(3):
+            name = await plugin._get_persona_name(Event.unified_msg_origin, Event())
+            self.assertEqual(name, "会话人格")
+        self.assertEqual(plugin.persona_mgr.resolve_count, 3)
+
+    async def test_no_persona_cache_config_remaining(self):
+        plugin = make_plugin()
+        self.assertFalse(hasattr(plugin, "persona_name_cache_ttl"))
+        self.assertFalse(hasattr(plugin, "_persona_name_cache"))
 
     async def test_group_history_scope_omits_user_filter(self):
         plugin = make_plugin(history_scope="group")
@@ -290,6 +679,96 @@ class AdapterLogicTests(unittest.IsolatedAsyncioTestCase):
         await plugin._query_chat_memory("umo_demo", "cid_demo", "10002")
         args, _ = plugin.context.query_recorder.args
         self.assertEqual(args[2], "10002")
+
+
+class LogConfigMigrationTests(unittest.IsolatedAsyncioTestCase):
+    def test_resolve_prefers_top_level(self):
+        self.assertTrue(
+            WakeLitePlugin._resolve_log_with_bot_id(
+                {"log_with_bot_id": True, "log_config": {"log_with_bot_id": False}}
+            )
+        )
+        self.assertFalse(
+            WakeLitePlugin._resolve_log_with_bot_id(
+                {"log_with_bot_id": False, "log_config": {"log_with_bot_id": True}}
+            )
+        )
+
+    def test_resolve_inherits_legacy_and_defaults_true(self):
+        self.assertTrue(
+            WakeLitePlugin._resolve_log_with_bot_id(
+                {"log_config": {"log_with_bot_id": True}}
+            )
+        )
+        self.assertFalse(
+            WakeLitePlugin._resolve_log_with_bot_id(
+                {"log_config": {"log_with_bot_id": False}}
+            )
+        )
+        self.assertTrue(WakeLitePlugin._resolve_log_with_bot_id({}))
+
+    def test_legacy_config_reads_at_construction_without_debug_switch(self):
+        plugin = make_plugin(
+            log_config={"log_with_bot_id": False, "debug_to_info": True}
+        )
+        self.assertFalse(plugin.log_with_bot_id)
+        self.assertFalse(hasattr(plugin, "debug_to_info"))
+        plugin._log("smoke", Event())
+
+    async def test_migrate_legacy_value_overrides_injected_default(self):
+        # AstrBot 完整性注入会把顶层键补成新 schema 默认 true；迁移发生在升级后
+        # 首次加载，旧组内的显式 false 才是旧用户意图，必须以它为准。
+        cfg = FakeConfig(
+            {"log_with_bot_id": True, "log_config": {"log_with_bot_id": False}}
+        )
+        plugin = WakeLitePlugin(Context(), cfg)
+
+        await plugin._migrate_log_config()
+
+        self.assertFalse(plugin.log_with_bot_id)
+        self.assertFalse(cfg["log_with_bot_id"])
+        self.assertNotIn("log_config", cfg)
+        self.assertEqual(cfg.save_count, 1)
+        self.assertFalse(cfg.saved.get("log_with_bot_id"))
+        self.assertNotIn("log_config", cfg.saved)
+
+    async def test_migrate_legacy_true_keeps_enabled(self):
+        cfg = FakeConfig({"log_config": {"log_with_bot_id": True}})
+        plugin = WakeLitePlugin(Context(), cfg)
+
+        await plugin._migrate_log_config()
+
+        self.assertTrue(plugin.log_with_bot_id)
+        self.assertTrue(cfg["log_with_bot_id"])
+        self.assertNotIn("log_config", cfg)
+
+    async def test_migrate_skips_without_legacy_group(self):
+        cfg = FakeConfig({"log_with_bot_id": True})
+        plugin = WakeLitePlugin(Context(), cfg)
+
+        await plugin._migrate_log_config()
+
+        self.assertEqual(cfg.save_count, 0)
+        self.assertTrue(cfg["log_with_bot_id"])
+
+    async def test_migrate_survives_unsaveable_config(self):
+        cfg = {"log_with_bot_id": True, "log_config": {"log_with_bot_id": False}}
+        plugin = WakeLitePlugin(Context(), cfg)
+
+        await plugin._migrate_log_config()
+
+        self.assertFalse(plugin.log_with_bot_id)
+        self.assertNotIn("log_config", cfg)
+
+    async def test_migrate_supports_sync_save(self):
+        cfg = SyncSaveConfig({"log_config": {"log_with_bot_id": False}})
+        plugin = WakeLitePlugin(Context(), cfg)
+
+        await plugin._migrate_log_config()
+
+        self.assertFalse(plugin.log_with_bot_id)
+        self.assertEqual(cfg.save_count, 1)
+        self.assertNotIn("log_config", cfg.saved)
 
 
 if __name__ == "__main__":

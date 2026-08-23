@@ -28,11 +28,12 @@ AstrBot 的轻量唤醒插件。在群聊场景下决定 bot 要不要对一条�
 - **群白名单**（`whitelist_groups`）：只有列表内的群聊走唤醒判定；不在列表的群完全不处理。
 - **唤醒 CD**（`wake_cd`）：按会话 + 用户独立计时，CD 期内该用户在当前会话的所有判定都跳过。
 - **复读过滤**：用户消息与 bot 最近 N 条回复（去标点后）完全相同时直接拦截，不进入唤醒判定。
+- **拒绝回复工具**（`enable_reject_tool`，默认 false）：开启后仅在智能唤醒的本轮向 LLM 注入 `wakelite_decline_reply` 工具。LLM 判断该话题实际不需要自己回复时（如用户明确在询问群里的另一个人、点名他人求助），可调用该工具放弃本轮回复，本轮不发送任何内容。@ 或指令唤醒不注入。
 
 ## 依赖
 
 - **jieba**（必需）—— 答疑/无聊/兴趣/相关性都依赖中文分词
-- **[chat_memory](https://github.com/W-Wolfycz/chat_memory) v1.0+**（可选，推荐）—— bot 历史回复的数据源。未安装或 `use_chat_memory=false` 时回退到 AstrBot 自带 history（此时 `bot_msgs_ttl` 不生效）
+- **[chat_memory](https://github.com/W-Wolfycz/chat_memory) v1.0+**（可选，推荐）—— bot 历史回复的数据源。未安装或 `use_chat_memory=false` 时回退到 AstrBot 自带 history（回退源没有时间信息，不参与时间衰减）
 
 ## 安装
 
@@ -40,17 +41,22 @@ AstrBot 的轻量唤醒插件。在群聊场景下决定 bot 要不要对一条�
 
 ## 配置
 
-16 个配置项，按相关性分组（WebUI 顺序一致）：
+15 个配置项，按相关性分组（WebUI 顺序一致）：
+
+### 日志
+- `log_with_bot_id`（bool，默认 true）—— 日志前缀变为 `[WakeLite:bot-self_id]`（如 `[WakeLite:bot-10001]`），bot 标识与模块名并存，多 Bot 环境方便定位
+- 日志等级在 AstrBot WebUI 插件详情页调整（DEBUG/INFO 等，运行期即时生效，无需重启），插件不再提供 debug 提级开关
+- 旧版 `log_config` 配置组会在插件加载时一次性迁移到顶层 `log_with_bot_id` 并自动删除；迁移失败不阻断加载，下次启动重试
 
 ### 准入 / 数据源
 - `whitelist_groups`（list）—— 群号列表。空列表 = 所有群都不处理
 - `bots`（list of `platform_id:self_id` 字符串，默认空）—— 多 bot 分流配置。空 = 关闭分流。详见下方「多 bot 分流」段
 - `use_chat_memory`（bool，默认 true）—— bot 历史是否走 chat_memory 插件
-- `history_scope`（`group` / `user`，默认 `group`）—— 决定候选 Bot 回复来自全群还是当前发送者；不读取历史用户消息，也不切分对话段落。仅影响 chat_memory 数据源
+- `history_scope`（`group` / `user`，默认 `group`）—— 候选 Bot 回复的来源：`group` = 全量消息（全群所有用户触发的回复）；`user` = 对话轮（只看当前发送者触发的回复）。不读取历史用户消息，也不切分对话段落。仅影响 chat_memory 数据源
+- `bot_msgs_maxlen`（历史条数上限，int，默认 15，最大 50）—— 候选 Bot 回复的最大数量：全量消息按条数截取最近回复，建议 10-30；对话轮按轮数截取最近几轮，建议 3-10
 
 ### 人格名唤醒
-- `persona_name_prob`（float，默认 0.5）—— 命中人格名后的唤醒概率
-- `persona_name_cache_ttl`（分钟，默认 1）—— 人格名查询缓存时长，0 = 不缓存
+- `persona_name_prob`（float，默认 0.5）—— 命中人格名后的唤醒概率。人格名每次实时解析（AstrBot 内部已缓存 persona 列表），无插件级缓存
 
 ### 兜底 / 文本判定
 - `prob`（float，默认 0）—— 概率唤醒，建议 0.01-0.1
@@ -62,25 +68,18 @@ AstrBot 的轻量唤醒插件。在群聊场景下决定 bot 要不要对一条�
 - `interest_threshold`（float，默认 0.5）—— 兴趣唤醒阈值
 - `similar_threshold`（float，默认 0.5）—— 相关性唤醒阈值
 
-### Bot 历史参数
-- `bot_msgs_maxlen`（int，默认 5）—— 最多取多少条近期 Bot 回复作为候选，不包含用户消息
-- `bot_msgs_ttl`（分钟，默认 10）—— bot 回复过期时间，0 = 不过期。使用 chat_memory 时优先按明确的 UTC 时间字段过滤
-
 ### 全局
 - `wake_cd`（秒，默认 0.5）—— 同一会话中同一用户两次唤醒的最小间隔，0 = 关闭
-
-### 日志
-- `log_config.log_with_bot_id`（bool，默认 true）—— 日志前缀变为 `[WakeLite:self_id]`（如 `[WakeLite:BOT1]`）
-- `log_config.debug_to_info`（bool，默认 false）—— debug 日志以 info 级别输出，便于查看拦截/分流判定
+- `enable_reject_tool`（bool，默认 false）—— 唤醒后允许 LLM 主动拒绝回复，详见「辅助机制」
 
 ## 历史与相关性如何工作
 
 WakeLite 不会把群聊自动切成“前段/中段/后段”，也不会把历史用户消息送进相关性计算。它只做以下步骤：
 
-1. 根据 `history_scope` 取得近期 Bot 回复候选；
-2. 受 `bot_msgs_maxlen` 和 `bot_msgs_ttl` 限制候选数量与时间；
-3. 把当前用户消息分别与每条候选 Bot 回复计算当前窗口的 TF-IDF cosine；
-4. 取最高相似度，与 `similar_threshold` 比较。
+1. 根据 `history_scope` 取得 Bot 回复候选（全量消息或对话轮）；
+2. 候选数量受 `bot_msgs_maxlen` 截断；
+3. 把当前用户消息分别与每条候选 Bot 回复计算当前窗口的 TF-IDF cosine，再按候选年龄做时间衰减（越新权重越高，年龄约 10 分钟时权重降为一半）；
+4. 取加权最高相似度，与 `similar_threshold` 比较。
 
 例如：
 
@@ -96,7 +95,7 @@ Bot：确实适合出去走走。
 - `history_scope=user`：最后一条只与由用户 A 触发的第一条 Bot 回复比较；
 - 用户 B 的“今天天气不错”本身不会进入比较，只有 Bot 对它的回复可能成为候选。
 
-`history_scope` 只决定候选回复来自全群还是当前用户；TF-IDF 只负责给这些候选计算相关程度。
+`history_scope` 只决定候选回复来自全群还是当前用户；TF-IDF 负责给这些候选计算相关程度，时间衰减负责让越新的候选越容易触发唤醒。旧话题的候选必须文本上足够接近才能盖过衰减。
 
 ## 多 bot 分流
 
@@ -130,6 +129,6 @@ Bot：确实适合出去走走。
 ## 设计取舍
 
 - **不引入 Pipeline/BaseStep**：只有一个 hook + 一个判定函数
-- **不持久化状态**：内存里的 `_last_wake` 和 `_persona_name_cache` 重启即清；运行中会惰性清理过期项
+- **不持久化状态**：内存里的 `_last_wake` 重启即清；运行中会惰性清理过期项
 - **不实现黑名单 / 阻塞 / 指令屏蔽 / 沉默检测 / 防抖**：交由其他插件处理
 - **不重复实现 @ 唤醒 / 引用唤醒**：AstrBot 自带，本插件只补充「智能唤醒」

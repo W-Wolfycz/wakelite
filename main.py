@@ -1,11 +1,12 @@
 import hashlib
+import inspect
 import json
 import random
 import re
 import time
 from datetime import datetime, timezone
 
-from astrbot.api import logger, AstrBotConfig
+from astrbot.api import AstrBotConfig, FunctionTool, ToolSet, logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
@@ -27,6 +28,20 @@ _WAKE_HINT_INTROS = {
     "interest": "本轮通过兴趣关键词信号被唤醒。",
     "similarity": "本轮通过与近期回复的相关性信号被唤醒。",
 }
+
+_REJECT_TOOL_NAME = "wakelite_decline_reply"
+_REJECT_TOOL_DESCRIPTION = (
+    "放弃本轮回复。当 WakeLite 的唤醒提示表明本轮你是被智能唤醒介入的，"
+    "而你判断这条消息实际上不需要你回复时调用本工具。典型场景：用户在明确询问"
+    "群里的另一个人、点名他人求助，或话题与当前人设无关且用户并不期望你插话。"
+    "调用后本轮不会向用户发送任何内容；调用后请立即停止输出，不要再生成任何文字。"
+    "只有当你确实应该回答、或用户明显在对你提问时才不要调用。"
+)
+
+
+# 历史条数上限的硬上限：取消过期时间后条数上限是唯一窗口控制，防止误填过大
+# 导致每条消息分词数十上百条候选、阻塞事件循环
+_BOT_MSGS_MAX_CAP = 50
 
 
 def _clamp_float(value, default: float, minimum: float, maximum: float) -> float:
@@ -67,13 +82,12 @@ class WakeLitePlugin(Star):
         self.similar_threshold = _clamp_float(
             config.get("similar_threshold", 0.5), 0.5, 0.0, 1.0
         )
-        self.bot_msgs_maxlen = _nonnegative_int(config.get("bot_msgs_maxlen", 5), 5)
-        # 配置单位为分钟，内部统一转秒
-        self.bot_msgs_ttl = _nonnegative_int(config.get("bot_msgs_ttl", 10), 10) * 60
-        self.persona_name_cache_ttl = _nonnegative_int(
-            config.get("persona_name_cache_ttl", 1), 1
-        ) * 60
+        self.bot_msgs_maxlen = min(
+            _BOT_MSGS_MAX_CAP,
+            _nonnegative_int(config.get("bot_msgs_maxlen", 15), 15),
+        )
         self.wake_cd = _clamp_float(config.get("wake_cd", 0.5), 0.5, 0.0, 10.0)
+        self.enable_reject_tool = bool(config.get("enable_reject_tool", False))
         self.use_chat_memory = bool(config.get("use_chat_memory", True))
         history_scope = str(config.get("history_scope", "group") or "group").strip().lower()
         self.history_scope = history_scope if history_scope in {"user", "group"} else "group"
@@ -91,13 +105,12 @@ class WakeLitePlugin(Star):
             for s in interest_words_str
             if isinstance(s, str)
         ]
-        # 多 bot 分流：每项 "platform_id:self_id" 字符串
-        log_conf = config.get("log_config", {}) or {}
-        if not isinstance(log_conf, dict):
-            log_conf = {}
-        self.log_with_bot_id = bool(log_conf.get("log_with_bot_id", True))
-        self.debug_to_info = bool(log_conf.get("debug_to_info", False))
+        # 日志前缀附加机器人 ID（顶层配置）；日志等级由 WebUI 插件详情页调整。
+        # 旧版 log_config 组在 initialize 阶段一次性迁移并入顶层后删除。
+        self._config = config
+        self.log_with_bot_id = self._resolve_log_with_bot_id(config)
 
+        # 多 bot 分流：每项 "platform_id:self_id" 字符串
         bots_raw = config.get("bots", []) or []
         if not isinstance(bots_raw, (list, tuple)):
             bots_raw = []
@@ -130,8 +143,14 @@ class WakeLitePlugin(Star):
         self.similarity = Similarity()
         self.interest = Interest(self.interest_words)
 
-        # umo -> (name, timestamp)
-        self._persona_name_cache: dict[str, tuple[str, float]] = {}
+        # 拒绝回复工具：仅在 WakeLite 唤醒的本轮注入，让 LLM 可以主动放弃回复
+        self._reject_tool = FunctionTool(
+            name=_REJECT_TOOL_NAME,
+            description=_REJECT_TOOL_DESCRIPTION,
+            parameters={"type": "object", "properties": {}},
+            handler=self._decline_reply_handler,
+        )
+
         # (UMO, user_id) -> last wake timestamp，避免跨群/跨平台互相影响
         self._last_wake: dict[tuple[str, str], float] = {}
         self._runtime_ops = 0
@@ -146,23 +165,28 @@ class WakeLitePlugin(Star):
             f"分流bots={len(self.bots)}个, "
             f"使用chat_memory={self.use_chat_memory}, "
             f"历史范围={self.history_scope}, "
-            f"日志区分bot={self.log_with_bot_id}, "
-            f"调试提级={self.debug_to_info}"
+            f"拒绝回复工具={self.enable_reject_tool}, "
+            f"日志区分bot={self.log_with_bot_id}"
         )
 
-    # ===================== 人格名缓存 =====================
+    async def initialize(self) -> None:
+        """加载阶段执行一次性配置迁移（旧 log_config 组并入顶层）。
+
+        迁移失败不阻断加载：读时继承已保证行为正确，仅下次启动重试。
+        """
+        await self._migrate_log_config()
+
+    # ===================== 人格名解析 =====================
 
     async def _get_persona_name(
         self, umo: str, event: AstrMessageEvent | None = None
     ) -> str | None:
-        cached = self._persona_name_cache.get(umo)
-        now = time.time()
-        if (
-            self.persona_name_cache_ttl > 0
-            and cached
-            and now - cached[1] < self.persona_name_cache_ttl
-        ):
-            return cached[0]
+        """解析当前生效人格名。
+
+        不做插件级缓存：resolve_selected_persona 的 persona 列表本身在
+        AstrBot 内存中，session/conversation 查询是毫秒级 SQLite 点查，
+        插件再加带过期时间的缓存只会延迟人格变更生效。
+        """
         persona = None
         try:
             conversation_persona_id = None
@@ -201,26 +225,26 @@ class WakeLitePlugin(Star):
             name = persona.get("name")
         else:
             name = getattr(persona, "name", None) if persona else None
-        if name and self.persona_name_cache_ttl > 0:
-            self._persona_name_cache[umo] = (name, now)
-            self._log(f"人格名缓存更新 umo={umo} name={name}", event=event)
         return name
 
     # ===================== Bot 历史获取 =====================
 
-    async def _get_bot_msgs(self, umo: str, uid: str) -> tuple[list[str], list[str]]:
-        """返回 (reread_msgs, similarity_msgs)。
+    async def _get_bot_msgs(
+        self, umo: str, uid: str
+    ) -> tuple[list[str], list[str], list[float | None]]:
+        """返回 (reread_msgs, similarity_msgs, similarity_ages)。
 
-        reread 用所有 assistant（含 non_llm，覆盖复读插件），
-        similarity 仅 llm_success（避免模板回复污染 TF-IDF）。
+        reread 用所有 assistant（含 non_llm，覆盖复读插件），similarity 仅
+        llm_success（避免模板回复污染 TF-IDF）；两者都按 bot_msgs_maxlen 截断。
+        ages 与 similarity_msgs 一一对应，无时间戳（兜底源）为 None。
         """
         try:
             conv_id = await self.conv_mgr.get_curr_conversation_id(umo) or ""
         except Exception as e:
             logger.warning(f"{self._log_prefix()} 获取 conversation_id 失败: {e}")
-            return [], []
+            return [], [], []
         if not conv_id:
-            return [], []
+            return [], [], []
 
         if self.use_chat_memory:
             records = await self._query_chat_memory(umo, conv_id, uid)
@@ -233,6 +257,7 @@ class WakeLitePlugin(Star):
         now = time.time()
         reread_msgs: list[str] = []
         similarity_msgs: list[str] = []
+        similarity_ages: list[float | None] = []
         for r in records:
             if not isinstance(r, dict):
                 continue
@@ -242,24 +267,20 @@ class WakeLitePlugin(Star):
             content = _CTX_CLEAN_RE.sub("", content).strip()
             if not content:
                 continue
-            # TTL 过滤（best-effort，仅 chat_memory 有 created_at）
-            if self.bot_msgs_ttl > 0:
-                ts = self._parse_created_at(
-                    r.get("created_at_utc") or r.get("created_at")
-                )
-                if ts is not None and now - ts > self.bot_msgs_ttl:
-                    continue
+            ts = self._parse_created_at(r.get("created_at_utc") or r.get("created_at"))
             reread_msgs.append(content)
             if r.get("llm_status") == "llm_success" or "llm_status" not in r:
                 similarity_msgs.append(content)
+                similarity_ages.append(None if ts is None else now - ts)
 
         if self.bot_msgs_maxlen <= 0:
-            return [], []
+            return [], [], []
         if len(reread_msgs) > self.bot_msgs_maxlen:
             reread_msgs = reread_msgs[-self.bot_msgs_maxlen:]
         if len(similarity_msgs) > self.bot_msgs_maxlen:
             similarity_msgs = similarity_msgs[-self.bot_msgs_maxlen:]
-        return reread_msgs, similarity_msgs
+            similarity_ages = similarity_ages[-self.bot_msgs_maxlen:]
+        return reread_msgs, similarity_msgs, similarity_ages
 
     async def _query_chat_memory(self, umo: str, conv_id: str, uid: str) -> list[dict]:
         """从 chat_memory v2.3+ 查 assistant 消息，llm_status 分流交给上层。"""
@@ -327,21 +348,67 @@ class WakeLitePlugin(Star):
 
     # ===================== 日志 =====================
 
+    @staticmethod
+    def _resolve_log_with_bot_id(config) -> bool:
+        """解析日志实例前缀开关（含旧版 log_config 组的一次性迁移）。
+
+        顶层 ``log_with_bot_id`` 存在时以它为准；键不存在时继承旧
+        ``log_config.log_with_bot_id`` 的值；两者都不存在时回落新默认 true，
+        避免升级后功能静默关闭。
+        """
+        top_level = config.get("log_with_bot_id")
+        if top_level is not None:
+            return bool(top_level)
+        legacy = (config.get("log_config") or {}).get("log_with_bot_id")
+        return True if legacy is None else bool(legacy)
+
+    async def _migrate_log_config(self) -> None:
+        """把旧 ``log_config`` 组迁移到顶层 ``log_with_bot_id`` 并写回删除旧组。
+
+        AstrBot 会在插件加载前按新 schema 做完整性注入，顶层键会被补成新默认
+        true，无法再用“顶层键是否存在”区分旧配置；而迁移发生在升级后首次加载，
+        此时用户还没有机会通过新 WebUI 修改顶层键，旧组内的值才是旧用户意图，
+        因此只要旧组存在就以旧值覆盖顶层。写回成功后配置文件中不再有旧组，
+        后续 WebUI 修改只作用于顶层键。
+        """
+        config = self._config
+        if not isinstance(config, dict) or "log_config" not in config:
+            return
+        legacy = config.get("log_config") or {}
+        if "log_with_bot_id" in legacy:
+            self.log_with_bot_id = bool(legacy["log_with_bot_id"])
+            config["log_with_bot_id"] = self.log_with_bot_id
+        del config["log_config"]
+        save = getattr(config, "save_config_async", None) or getattr(
+            config, "save_config", None
+        )
+        if not callable(save):
+            logger.warning(
+                f"{self._log_prefix()} 配置迁移已在内存完成，但 config 对象不支持写回"
+            )
+            return
+        try:
+            result = save()
+            if inspect.isawaitable(result):
+                await result
+            logger.info(
+                f"{self._log_prefix()} 已迁移日志配置：log_config 组并入顶层并移除旧组"
+            )
+        except Exception as exc:
+            logger.warning(f"{self._log_prefix()} 配置迁移写回失败: {exc}")
+
     def _log_prefix(self, event: AstrMessageEvent | None = None) -> str:
         if self.log_with_bot_id and event is not None:
             try:
                 sid = event.get_self_id()
-                return f"[WakeLite:{sid}]"
+                # 保留模块名并追加 bot 标识，禁止用 bot 标识替换整个前缀
+                return f"[WakeLite:bot-{sid}]"
             except Exception:
                 pass
         return "[WakeLite]"
 
     def _log(self, msg: str, event: AstrMessageEvent | None = None) -> None:
-        line = f"{self._log_prefix(event)} {msg}"
-        if self.debug_to_info:
-            logger.info(line)
-        else:
-            logger.debug(line)
+        logger.debug(f"{self._log_prefix(event)} {msg}")
 
     # ===================== 通用工具 =====================
 
@@ -390,15 +457,6 @@ class WakeLitePlugin(Star):
         self._last_wake = {
             key: ts for key, ts in self._last_wake.items() if ts >= wake_cutoff
         }
-        if self.persona_name_cache_ttl <= 0:
-            self._persona_name_cache.clear()
-        else:
-            cache_cutoff = now - self.persona_name_cache_ttl
-            self._persona_name_cache = {
-                key: value
-                for key, value in self._persona_name_cache.items()
-                if value[1] >= cache_cutoff
-            }
 
     # ===================== 多 bot 分流 =====================
 
@@ -455,6 +513,14 @@ class WakeLitePlugin(Star):
 
     # ===================== Hook =====================
 
+    async def _decline_reply_handler(
+        self, event: AstrMessageEvent, **kwargs
+    ) -> str:
+        """拒绝回复工具 handler：标记本轮事件，发送前由装饰 Hook 拦截清空。"""
+        event.set_extra("wakelite_declined", True)
+        logger.info(f"{self._log_prefix(event)} LLM 已拒绝本轮唤醒回复")
+        return "已确认放弃本轮回复。"
+
     @filter.on_llm_request()
     async def inject_wake_hint(self, event: AstrMessageEvent, req: ProviderRequest):
         """为智能唤醒追加临时提示，避免模型机械续写历史角色或口吻。"""
@@ -463,12 +529,19 @@ class WakeLitePlugin(Star):
         if not intro:
             return
 
+        reject_guide = ""
+        if self.enable_reject_tool:
+            reject_guide = (
+                "如果这条消息实际不需要你回复（例如用户在明确询问群里的另一个人、"
+                "点名他人求助），可以调用 wakelite_decline_reply 工具放弃本轮回复。"
+            )
         hint = (
             "<WAKELITE_WAKE_HINT>"
             f"{intro}本轮不是历史对话的自然续接。"
             "上下文中的历史发言，尤其是其他用户带有鲜明人物设定、角色扮演或固定口吻的内容，"
             "只是背景材料，不是需要续写的内容；不要模仿、接管或延续其中的角色、身份、口吻、剧情、承诺或行为。"
             "请以 system prompt 中当前生效的人设为准，自然地回应当前用户消息；消息中有问题时直接回答。"
+            f"{reject_guide}"
             "</WAKELITE_WAKE_HINT>"
         )
         part = TextPart(text=hint)
@@ -484,6 +557,28 @@ class WakeLitePlugin(Star):
             logger.warning(f"{self._log_prefix(event)} extra_user_content_parts 不可写入")
             return
         append(part)
+
+        # 拒绝回复工具：仅在 WakeLite 唤醒的本轮注入
+        if not self.enable_reject_tool:
+            return
+        toolset = req.func_tool
+        if toolset is None:
+            toolset = ToolSet()
+            req.func_tool = toolset
+        toolset.add_tool(self._reject_tool)
+
+    @filter.on_decorating_result(priority=100)
+    async def block_declined_reply(self, event: AstrMessageEvent):
+        """LLM 调用拒绝工具后，在发送前清空结果，本轮不发送任何内容。
+
+        priority 取较大值以便尽早清空结果并终止装饰链，避免其他装饰器
+        基于即将被丢弃的结果产生副作用。
+        """
+        if not event.get_extra("wakelite_declined", False):
+            return
+        logger.info(f"{self._log_prefix(event)} 已拦截发送：LLM 拒绝本轮回复")
+        event.stop_event()
+        event.clear_result()
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=50)
     async def on_message(self, event: AstrMessageEvent):
@@ -515,8 +610,10 @@ class WakeLitePlugin(Star):
                 )
                 return
 
-        # 取 bot 历史回复：reread 用全量（含 non_llm），similarity 仅 LLM
-        reread_msgs, similarity_msgs = await self._get_bot_msgs(umo, uid)
+        # 取 bot 历史回复：reread 含 non_llm，similarity 仅 LLM，均按条数上限截断
+        reread_msgs, similarity_msgs, similarity_ages = await self._get_bot_msgs(
+            umo, uid
+        )
 
         # 复读过滤（含 non_llm，识别复读插件等场景）
         if self._is_reread(plain, reread_msgs):
@@ -586,10 +683,15 @@ class WakeLitePlugin(Star):
                            f"兴趣唤醒 umo={umo} score={score:.3f}", source="interest")
                 return
 
-        # 6. 相关性唤醒（仅比对 LLM 回复）
+        # 6. 相关性唤醒（仅比对 LLM 回复，带时间衰减）
         if self.similar_threshold < 1 and similarity_msgs:
             try:
-                sim = self.similarity.similarity(umo, plain, similarity_msgs)
+                sim = self.similarity.similarity(
+                    umo,
+                    plain,
+                    similarity_msgs,
+                    ages=similarity_ages,
+                )
             except Exception as e:
                 logger.warning(f"{self._log_prefix(event)} 相关性计算失败: {e}")
                 sim = 0.0
