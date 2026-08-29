@@ -1,5 +1,4 @@
 import hashlib
-import inspect
 import json
 import random
 import re
@@ -34,9 +33,14 @@ _REJECT_TOOL_DESCRIPTION = (
     "放弃本轮回复。当 WakeLite 的唤醒提示表明本轮你是被智能唤醒介入的，"
     "而你判断这条消息实际上不需要你回复时调用本工具。典型场景：用户在明确询问"
     "群里的另一个人、点名他人求助，或话题与当前人设无关且用户并不期望你插话。"
-    "调用后本轮不会向用户发送任何内容；调用后请立即停止输出，不要再生成任何文字。"
+    "调用本工具前不要输出任何文字；调用后本轮不会向用户发送任何内容，"
+    "请立即停止输出，不要再生成任何文字。"
     "只有当你确实应该回答、或用户明显在对你提问时才不要调用。"
 )
+
+# 拒绝工具默认注入范围：仅弱信号唤醒（概率/无聊/兴趣/相关性）；
+# 强信号（人格名/答疑）默认不注入，被点名或用户在提问时拒绝体验很差
+_REJECT_DEFAULT_SCOPES = ("probability", "bored", "interest", "similarity")
 
 
 # 历史条数上限的硬上限：取消过期时间后条数上限是唯一窗口控制，防止误填过大
@@ -88,6 +92,12 @@ class WakeLitePlugin(Star):
         )
         self.wake_cd = _clamp_float(config.get("wake_cd", 0.5), 0.5, 0.0, 10.0)
         self.enable_reject_tool = bool(config.get("enable_reject_tool", False))
+        scopes_raw = config.get("reject_tool_scopes", None)
+        if not isinstance(scopes_raw, (list, tuple, set)):
+            scopes_raw = _REJECT_DEFAULT_SCOPES
+        self.reject_tool_scopes: set[str] = {
+            s for s in scopes_raw if s in _WAKE_HINT_INTROS
+        }
         self.use_chat_memory = bool(config.get("use_chat_memory", True))
         history_scope = str(config.get("history_scope", "group") or "group").strip().lower()
         self.history_scope = history_scope if history_scope in {"user", "group"} else "group"
@@ -106,9 +116,8 @@ class WakeLitePlugin(Star):
             if isinstance(s, str)
         ]
         # 日志前缀附加机器人 ID（顶层配置）；日志等级由 WebUI 插件详情页调整。
-        # 旧版 log_config 组在 initialize 阶段一次性迁移并入顶层后删除。
-        self._config = config
-        self.log_with_bot_id = self._resolve_log_with_bot_id(config)
+        # 旧 log_config 组由 AstrBot 按新 schema 在加载前自动清理，插件不写迁移。
+        self.log_with_bot_id = bool(config.get("log_with_bot_id", True))
 
         # 多 bot 分流：每项 "platform_id:self_id" 字符串
         bots_raw = config.get("bots", []) or []
@@ -165,16 +174,10 @@ class WakeLitePlugin(Star):
             f"分流bots={len(self.bots)}个, "
             f"使用chat_memory={self.use_chat_memory}, "
             f"历史范围={self.history_scope}, "
-            f"拒绝回复工具={self.enable_reject_tool}, "
+            f"拒绝回复工具={self.enable_reject_tool}"
+            f"({','.join(sorted(self.reject_tool_scopes)) or '-'}), "
             f"日志区分bot={self.log_with_bot_id}"
         )
-
-    async def initialize(self) -> None:
-        """加载阶段执行一次性配置迁移（旧 log_config 组并入顶层）。
-
-        迁移失败不阻断加载：读时继承已保证行为正确，仅下次启动重试。
-        """
-        await self._migrate_log_config()
 
     # ===================== 人格名解析 =====================
 
@@ -238,6 +241,8 @@ class WakeLitePlugin(Star):
         llm_success（避免模板回复污染 TF-IDF）；两者都按 bot_msgs_maxlen 截断。
         ages 与 similarity_msgs 一一对应，无时间戳（兜底源）为 None。
         """
+        if self.bot_msgs_maxlen <= 0:
+            return [], [], []  # 历史已禁用，跳过查询
         try:
             conv_id = await self.conv_mgr.get_curr_conversation_id(umo) or ""
         except Exception as e:
@@ -273,8 +278,6 @@ class WakeLitePlugin(Star):
                 similarity_msgs.append(content)
                 similarity_ages.append(None if ts is None else now - ts)
 
-        if self.bot_msgs_maxlen <= 0:
-            return [], [], []
         if len(reread_msgs) > self.bot_msgs_maxlen:
             reread_msgs = reread_msgs[-self.bot_msgs_maxlen:]
         if len(similarity_msgs) > self.bot_msgs_maxlen:
@@ -348,61 +351,12 @@ class WakeLitePlugin(Star):
 
     # ===================== 日志 =====================
 
-    @staticmethod
-    def _resolve_log_with_bot_id(config) -> bool:
-        """解析日志实例前缀开关（含旧版 log_config 组的一次性迁移）。
-
-        顶层 ``log_with_bot_id`` 存在时以它为准；键不存在时继承旧
-        ``log_config.log_with_bot_id`` 的值；两者都不存在时回落新默认 true，
-        避免升级后功能静默关闭。
-        """
-        top_level = config.get("log_with_bot_id")
-        if top_level is not None:
-            return bool(top_level)
-        legacy = (config.get("log_config") or {}).get("log_with_bot_id")
-        return True if legacy is None else bool(legacy)
-
-    async def _migrate_log_config(self) -> None:
-        """把旧 ``log_config`` 组迁移到顶层 ``log_with_bot_id`` 并写回删除旧组。
-
-        AstrBot 会在插件加载前按新 schema 做完整性注入，顶层键会被补成新默认
-        true，无法再用“顶层键是否存在”区分旧配置；而迁移发生在升级后首次加载，
-        此时用户还没有机会通过新 WebUI 修改顶层键，旧组内的值才是旧用户意图，
-        因此只要旧组存在就以旧值覆盖顶层。写回成功后配置文件中不再有旧组，
-        后续 WebUI 修改只作用于顶层键。
-        """
-        config = self._config
-        if not isinstance(config, dict) or "log_config" not in config:
-            return
-        legacy = config.get("log_config") or {}
-        if "log_with_bot_id" in legacy:
-            self.log_with_bot_id = bool(legacy["log_with_bot_id"])
-            config["log_with_bot_id"] = self.log_with_bot_id
-        del config["log_config"]
-        save = getattr(config, "save_config_async", None) or getattr(
-            config, "save_config", None
-        )
-        if not callable(save):
-            logger.warning(
-                f"{self._log_prefix()} 配置迁移已在内存完成，但 config 对象不支持写回"
-            )
-            return
-        try:
-            result = save()
-            if inspect.isawaitable(result):
-                await result
-            logger.info(
-                f"{self._log_prefix()} 已迁移日志配置：log_config 组并入顶层并移除旧组"
-            )
-        except Exception as exc:
-            logger.warning(f"{self._log_prefix()} 配置迁移写回失败: {exc}")
-
     def _log_prefix(self, event: AstrMessageEvent | None = None) -> str:
         if self.log_with_bot_id and event is not None:
             try:
                 sid = event.get_self_id()
-                # 保留模块名并追加 bot 标识，禁止用 bot 标识替换整个前缀
-                return f"[WakeLite:bot-{sid}]"
+                # 模块名段 + bot 标识段并存，禁止用 bot 标识替换整个前缀
+                return f"[WakeLite][bot-{sid}]"
             except Exception:
                 pass
         return "[WakeLite]"
@@ -443,8 +397,11 @@ class WakeLitePlugin(Star):
         source: str | None = None,
     ) -> None:
         event.is_at_or_wake_command = True
-        # on_llm_request 才能拿到 ProviderRequest；先把来源挂在当前事件上。
-        event._wakelite_wake_source = source if source in _WAKE_HINT_INTROS else None
+        # on_llm_request 才能拿到 ProviderRequest；先把来源存入事件 extras。
+        event.set_extra(
+            "wakelite_wake_source",
+            source if source in _WAKE_HINT_INTROS else None,
+        )
         self._last_wake[(event.unified_msg_origin, uid)] = now
         logger.info(f"{self._log_prefix(event)} {reason}")
 
@@ -524,13 +481,15 @@ class WakeLitePlugin(Star):
     @filter.on_llm_request()
     async def inject_wake_hint(self, event: AstrMessageEvent, req: ProviderRequest):
         """为智能唤醒追加临时提示，避免模型机械续写历史角色或口吻。"""
-        source = getattr(event, "_wakelite_wake_source", None)
+        source = event.get_extra("wakelite_wake_source", None)
         intro = _WAKE_HINT_INTROS.get(source)
         if not intro:
             return
 
+        # 拒绝回复工具仅对配置范围内（默认弱信号）的唤醒源注入
+        reject_allowed = self.enable_reject_tool and source in self.reject_tool_scopes
         reject_guide = ""
-        if self.enable_reject_tool:
+        if reject_allowed:
             reject_guide = (
                 "如果这条消息实际不需要你回复（例如用户在明确询问群里的另一个人、"
                 "点名他人求助），可以调用 wakelite_decline_reply 工具放弃本轮回复。"
@@ -558,21 +517,28 @@ class WakeLitePlugin(Star):
             return
         append(part)
 
-        # 拒绝回复工具：仅在 WakeLite 唤醒的本轮注入
-        if not self.enable_reject_tool:
+        # 拒绝回复工具：仅对配置范围内（默认弱信号）的唤醒源注入
+        if not reject_allowed:
             return
         toolset = req.func_tool
         if toolset is None:
             toolset = ToolSet()
             req.func_tool = toolset
-        toolset.add_tool(self._reject_tool)
+        add_tool = getattr(toolset, "add_tool", None)
+        if not callable(add_tool):
+            logger.warning(
+                f"{self._log_prefix(event)} func_tool 非 ToolSet 类型，拒绝工具注入跳过"
+            )
+            return
+        add_tool(self._reject_tool)
 
     @filter.on_decorating_result(priority=100)
     async def block_declined_reply(self, event: AstrMessageEvent):
         """LLM 调用拒绝工具后，在发送前清空结果，本轮不发送任何内容。
 
-        priority 取较大值以便尽早清空结果并终止装饰链，避免其他装饰器
-        基于即将被丢弃的结果产生副作用。
+        priority 刻意低于审计类插件（如 chat_memory=10000），让位于统计链：
+        拒绝轮的残余结果仍会被审计插件按原样记录，本 Hook 只负责发送前的
+        最终清空与终止装饰链。
         """
         if not event.get_extra("wakelite_declined", False):
             return

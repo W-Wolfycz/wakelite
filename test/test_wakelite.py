@@ -201,6 +201,9 @@ class Event:
     def get_platform_name(self):
         return "aiocqhttp"
 
+    def get_platform_id(self):
+        return "BOT1"
+
     def get_self_id(self):
         return self.self_id
 
@@ -235,32 +238,6 @@ class Event:
 
     def is_stopped(self):
         return self._force_stopped
-
-
-class FakeConfig(dict):
-    """模拟支持写回的 AstrBotConfig（异步 save_config_async）。"""
-
-    def __init__(self, data):
-        super().__init__(data)
-        self.save_count = 0
-        self.saved = None
-
-    async def save_config_async(self):
-        self.save_count += 1
-        self.saved = dict(self)
-
-
-class SyncSaveConfig(dict):
-    """模拟仅提供同步 save_config 的 config 对象。"""
-
-    def __init__(self, data):
-        super().__init__(data)
-        self.save_count = 0
-        self.saved = None
-
-    def save_config(self):
-        self.save_count += 1
-        self.saved = dict(self)
 
 
 def make_plugin(**overrides):
@@ -414,6 +391,14 @@ class CandidateWindowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sims), 10)
         self.assertTrue(all(a is not None and a > 3600 for a in ages))
 
+    async def test_disabled_history_skips_query(self):
+        plugin = make_plugin(bot_msgs_maxlen=0)
+
+        reread, sims, ages = await plugin._get_bot_msgs("umo_demo", "10002")
+
+        self.assertEqual((reread, sims, ages), ([], [], []))
+        self.assertIsNone(plugin.context.query_recorder.args)  # 未发生查询
+
     async def test_fallback_source_ages_are_none(self):
         plugin = make_plugin(use_chat_memory=False, bot_msgs_maxlen=5)
         Conversation.history = json.dumps(
@@ -484,7 +469,7 @@ class WakeHintTests(unittest.IsolatedAsyncioTestCase):
     async def test_reject_guide_added_to_hint_when_tool_enabled(self):
         plugin = make_plugin(enable_reject_tool=True)
         event = Event()
-        plugin._wake(event, "10002", 123.0, "答疑唤醒", source="ask")
+        plugin._wake(event, "10002", 123.0, "概率唤醒", source="probability")
         req = ProviderRequest()
 
         await plugin.inject_wake_hint(event, req)
@@ -493,6 +478,16 @@ class WakeHintTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_reject_guide_when_tool_disabled(self):
         plugin = make_plugin(enable_reject_tool=False)
+        event = Event()
+        plugin._wake(event, "10002", 123.0, "概率唤醒", source="probability")
+        req = ProviderRequest()
+
+        await plugin.inject_wake_hint(event, req)
+
+        self.assertNotIn("wakelite_decline_reply", req.extra_user_content_parts[0].text)
+
+    async def test_no_reject_guide_for_strong_signal_by_default(self):
+        plugin = make_plugin(enable_reject_tool=True)
         event = Event()
         plugin._wake(event, "10002", 123.0, "答疑唤醒", source="ask")
         req = ProviderRequest()
@@ -553,7 +548,7 @@ class OnMessageTests(unittest.IsolatedAsyncioTestCase):
         await plugin.on_message(event)
 
         self.assertTrue(event.is_at_or_wake_command)
-        self.assertEqual(event._wakelite_wake_source, "probability")
+        self.assertEqual(event.get_extra("wakelite_wake_source"), "probability")
 
     async def test_persona_name_wake_sets_flag(self):
         plugin = self._quiet_plugin(persona_name_prob=1.0)
@@ -563,17 +558,23 @@ class OnMessageTests(unittest.IsolatedAsyncioTestCase):
         await plugin.on_message(event)
 
         self.assertTrue(event.is_at_or_wake_command)
-        self.assertEqual(event._wakelite_wake_source, "persona_name")
+        self.assertEqual(event.get_extra("wakelite_wake_source"), "persona_name")
 
 
 class RejectToolTests(unittest.IsolatedAsyncioTestCase):
     def test_reject_tool_disabled_by_default(self):
         self.assertFalse(make_plugin().enable_reject_tool)
 
+    def test_default_scopes_are_weak_signals_only(self):
+        self.assertEqual(
+            make_plugin().reject_tool_scopes,
+            {"probability", "bored", "interest", "similarity"},
+        )
+
     async def test_tool_injected_when_woken_and_enabled(self):
         plugin = make_plugin(enable_reject_tool=True)
         event = Event()
-        plugin._wake(event, "10002", 123.0, "答疑唤醒", source="ask")
+        plugin._wake(event, "10002", 123.0, "概率唤醒", source="probability")
         req = ProviderRequest()
 
         await plugin.inject_wake_hint(event, req)
@@ -592,6 +593,16 @@ class RejectToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_tool_not_injected_when_disabled(self):
         plugin = make_plugin(enable_reject_tool=False)
         event = Event()
+        plugin._wake(event, "10002", 123.0, "概率唤醒", source="probability")
+        req = ProviderRequest()
+
+        await plugin.inject_wake_hint(event, req)
+
+        self.assertIsNone(req.func_tool)
+
+    async def test_strong_signal_not_injected_by_default_scopes(self):
+        plugin = make_plugin(enable_reject_tool=True)
+        event = Event()
         plugin._wake(event, "10002", 123.0, "答疑唤醒", source="ask")
         req = ProviderRequest()
 
@@ -599,10 +610,27 @@ class RejectToolTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(req.func_tool)
 
+    async def test_strong_signal_injected_when_explicitly_scoped(self):
+        plugin = make_plugin(
+            enable_reject_tool=True, reject_tool_scopes=["probability", "ask"]
+        )
+        event = Event()
+        plugin._wake(event, "10002", 123.0, "答疑唤醒", source="ask")
+        req = ProviderRequest()
+
+        await plugin.inject_wake_hint(event, req)
+
+        self.assertIsNotNone(req.func_tool)
+        self.assertIn("wakelite_decline_reply", req.func_tool.names())
+
+    def test_invalid_scope_values_ignored(self):
+        plugin = make_plugin(reject_tool_scopes=["ask", "bogus", 123])
+        self.assertEqual(plugin.reject_tool_scopes, {"ask"})
+
     async def test_injection_preserves_existing_tools(self):
         plugin = make_plugin(enable_reject_tool=True)
         event = Event()
-        plugin._wake(event, "10002", 123.0, "答疑唤醒", source="ask")
+        plugin._wake(event, "10002", 123.0, "概率唤醒", source="probability")
         req = ProviderRequest()
         req.func_tool = ToolSet()
         req.func_tool.add_tool(
@@ -614,6 +642,28 @@ class RejectToolTests(unittest.IsolatedAsyncioTestCase):
         names = req.func_tool.names()
         self.assertIn("other_tool", names)
         self.assertIn("wakelite_decline_reply", names)
+
+    async def test_non_toolset_func_tool_skips_injection_safely(self):
+        plugin = make_plugin(enable_reject_tool=True)
+        event = Event()
+        plugin._wake(event, "10002", 123.0, "概率唤醒", source="probability")
+        req = ProviderRequest()
+        req.func_tool = ["not", "a", "toolset"]  # 异常类型防护
+
+        await plugin.inject_wake_hint(event, req)  # 不应抛异常
+
+        self.assertEqual(req.func_tool, ["not", "a", "toolset"])
+
+    async def test_unwritable_parts_skips_hint_safely(self):
+        plugin = make_plugin()
+        event = Event()
+        plugin._wake(event, "10002", 123.0, "概率唤醒", source="probability")
+        req = ProviderRequest()
+        req.extra_user_content_parts = tuple()  # 无 append 的容器
+
+        await plugin.inject_wake_hint(event, req)  # 不应抛异常
+
+        self.assertEqual(req.extra_user_content_parts, tuple())
 
     async def test_decline_handler_marks_event(self):
         plugin = make_plugin()
@@ -680,95 +730,29 @@ class AdapterLogicTests(unittest.IsolatedAsyncioTestCase):
         args, _ = plugin.context.query_recorder.args
         self.assertEqual(args[2], "10002")
 
+    def test_compute_my_turn_bot_sender_excluded_from_pool(self):
+        plugin = make_plugin(bots=["BOT1:10001", "BOT2:10002"])
+        event = Event()  # 本 bot 为 BOT1:10001，消息来自 BOT2:10002
+        # 活跃池排除发送者后只剩自己，hash % 1 == 0 恒真 → 轮到自己
+        self.assertTrue(plugin._compute_my_turn(event, "10002", "10001"))
 
-class LogConfigMigrationTests(unittest.IsolatedAsyncioTestCase):
-    def test_resolve_prefers_top_level(self):
-        self.assertTrue(
-            WakeLitePlugin._resolve_log_with_bot_id(
-                {"log_with_bot_id": True, "log_config": {"log_with_bot_id": False}}
-            )
-        )
-        self.assertFalse(
-            WakeLitePlugin._resolve_log_with_bot_id(
-                {"log_with_bot_id": False, "log_config": {"log_with_bot_id": True}}
-            )
-        )
+    def test_compute_my_turn_single_bot_sender_leaves_empty_pool(self):
+        plugin = make_plugin(bots=["BOT1:10001"])
+        event = Event()
+        self.assertFalse(plugin._compute_my_turn(event, "10001", "10001"))
 
-    def test_resolve_inherits_legacy_and_defaults_true(self):
-        self.assertTrue(
-            WakeLitePlugin._resolve_log_with_bot_id(
-                {"log_config": {"log_with_bot_id": True}}
-            )
-        )
-        self.assertFalse(
-            WakeLitePlugin._resolve_log_with_bot_id(
-                {"log_config": {"log_with_bot_id": False}}
-            )
-        )
-        self.assertTrue(WakeLitePlugin._resolve_log_with_bot_id({}))
 
-    def test_legacy_config_reads_at_construction_without_debug_switch(self):
-        plugin = make_plugin(
-            log_config={"log_with_bot_id": False, "debug_to_info": True}
-        )
-        self.assertFalse(plugin.log_with_bot_id)
-        self.assertFalse(hasattr(plugin, "debug_to_info"))
-        plugin._log("smoke", Event())
+class LogConfigTests(unittest.TestCase):
+    def test_log_with_bot_id_reads_top_level_and_defaults_true(self):
+        self.assertTrue(make_plugin(log_with_bot_id=True).log_with_bot_id)
+        self.assertFalse(make_plugin(log_with_bot_id=False).log_with_bot_id)
+        self.assertTrue(make_plugin().log_with_bot_id)  # 缺省默认 true
 
-    async def test_migrate_legacy_value_overrides_injected_default(self):
-        # AstrBot 完整性注入会把顶层键补成新 schema 默认 true；迁移发生在升级后
-        # 首次加载，旧组内的显式 false 才是旧用户意图，必须以它为准。
-        cfg = FakeConfig(
-            {"log_with_bot_id": True, "log_config": {"log_with_bot_id": False}}
-        )
-        plugin = WakeLitePlugin(Context(), cfg)
-
-        await plugin._migrate_log_config()
-
-        self.assertFalse(plugin.log_with_bot_id)
-        self.assertFalse(cfg["log_with_bot_id"])
-        self.assertNotIn("log_config", cfg)
-        self.assertEqual(cfg.save_count, 1)
-        self.assertFalse(cfg.saved.get("log_with_bot_id"))
-        self.assertNotIn("log_config", cfg.saved)
-
-    async def test_migrate_legacy_true_keeps_enabled(self):
-        cfg = FakeConfig({"log_config": {"log_with_bot_id": True}})
-        plugin = WakeLitePlugin(Context(), cfg)
-
-        await plugin._migrate_log_config()
-
-        self.assertTrue(plugin.log_with_bot_id)
-        self.assertTrue(cfg["log_with_bot_id"])
-        self.assertNotIn("log_config", cfg)
-
-    async def test_migrate_skips_without_legacy_group(self):
-        cfg = FakeConfig({"log_with_bot_id": True})
-        plugin = WakeLitePlugin(Context(), cfg)
-
-        await plugin._migrate_log_config()
-
-        self.assertEqual(cfg.save_count, 0)
-        self.assertTrue(cfg["log_with_bot_id"])
-
-    async def test_migrate_survives_unsaveable_config(self):
-        cfg = {"log_with_bot_id": True, "log_config": {"log_with_bot_id": False}}
-        plugin = WakeLitePlugin(Context(), cfg)
-
-        await plugin._migrate_log_config()
-
-        self.assertFalse(plugin.log_with_bot_id)
-        self.assertNotIn("log_config", cfg)
-
-    async def test_migrate_supports_sync_save(self):
-        cfg = SyncSaveConfig({"log_config": {"log_with_bot_id": False}})
-        plugin = WakeLitePlugin(Context(), cfg)
-
-        await plugin._migrate_log_config()
-
-        self.assertFalse(plugin.log_with_bot_id)
-        self.assertEqual(cfg.save_count, 1)
-        self.assertNotIn("log_config", cfg.saved)
+    def test_no_legacy_migration_code_remaining(self):
+        plugin = make_plugin()
+        self.assertFalse(hasattr(plugin, "_migrate_log_config"))
+        self.assertFalse(hasattr(plugin, "_resolve_log_with_bot_id"))
+        self.assertFalse(hasattr(plugin, "initialize"))
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ AstrBot 的轻量唤醒插件。在群聊场景下决定 bot 要不要对一条�
 - **群白名单**（`whitelist_groups`）：只有列表内的群聊走唤醒判定；不在列表的群完全不处理。
 - **唤醒 CD**（`wake_cd`）：按会话 + 用户独立计时，CD 期内该用户在当前会话的所有判定都跳过。
 - **复读过滤**：用户消息与 bot 最近 N 条回复（去标点后）完全相同时直接拦截，不进入唤醒判定。
-- **拒绝回复工具**（`enable_reject_tool`，默认 false）：开启后仅在智能唤醒的本轮向 LLM 注入 `wakelite_decline_reply` 工具。LLM 判断该话题实际不需要自己回复时（如用户明确在询问群里的另一个人、点名他人求助），可调用该工具放弃本轮回复，本轮不发送任何内容。@ 或指令唤醒不注入。
+- **拒绝回复工具**（`enable_reject_tool` 总开关，默认 false）：开启后仅在智能唤醒的本轮向 LLM 注入 `wakelite_decline_reply` 工具。LLM 判断该话题实际不需要自己回复时（如用户明确在询问群里的另一个人、点名他人求助），可调用该工具放弃本轮回复，本轮不发送任何内容。@ 或指令唤醒不注入；哪些唤醒方式注入由 `reject_tool_scopes` 勾选（默认仅弱信号：概率/无聊/兴趣/相关性，人格名与答疑默认不注入）。
 
 ## 依赖
 
@@ -41,12 +41,12 @@ AstrBot 的轻量唤醒插件。在群聊场景下决定 bot 要不要对一条�
 
 ## 配置
 
-15 个配置项，按相关性分组（WebUI 顺序一致）：
+16 个配置项，按相关性分组（WebUI 顺序一致）：
 
 ### 日志
-- `log_with_bot_id`（bool，默认 true）—— 日志前缀变为 `[WakeLite:bot-self_id]`（如 `[WakeLite:bot-10001]`），bot 标识与模块名并存，多 Bot 环境方便定位
+- `log_with_bot_id`（bool，默认 true）—— 日志前缀变为 `[WakeLite][bot-self_id]`（如 `[WakeLite][bot-10001]`），模块名与 bot 标识并存，多 Bot 环境方便定位
 - 日志等级在 AstrBot WebUI 插件详情页调整（DEBUG/INFO 等，运行期即时生效，无需重启），插件不再提供 debug 提级开关
-- 旧版 `log_config` 配置组会在插件加载时一次性迁移到顶层 `log_with_bot_id` 并自动删除；迁移失败不阻断加载，下次启动重试
+- 旧版 `log_config` 配置组由 AstrBot 按新 schema 自动清理并注入新键默认值，旧开关值不会被继承；升级后请在 WebUI 确认日志前缀开关
 
 ### 准入 / 数据源
 - `whitelist_groups`（list）—— 群号列表。空列表 = 所有群都不处理
@@ -70,7 +70,8 @@ AstrBot 的轻量唤醒插件。在群聊场景下决定 bot 要不要对一条�
 
 ### 全局
 - `wake_cd`（秒，默认 0.5）—— 同一会话中同一用户两次唤醒的最小间隔，0 = 关闭
-- `enable_reject_tool`（bool，默认 false）—— 唤醒后允许 LLM 主动拒绝回复，详见「辅助机制」
+- `enable_reject_tool`（bool，默认 false）—— 拒绝回复工具总开关，详见「辅助机制」
+- `reject_tool_scopes`（多选，默认 probability/bored/interest/similarity）—— 勾选哪些唤醒方式允许 Bot 主动放弃回复；未勾选的唤醒方式即使总开关开启也不注入该能力
 
 ## 历史与相关性如何工作
 

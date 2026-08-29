@@ -123,6 +123,13 @@
     "description": "唤醒后允许 LLM 主动拒绝回复",
     "type": "bool",
     "default": false,
-    "hint": "开启后，被智能唤醒的 Bot 如果判断话题不需要自己回复（比如用户在问群里另一个人），可以主动放弃回复。只在智能唤醒时生效。"
+    "hint": "总开关。开启后，被智能唤醒的 Bot 如果判断话题不需要自己回复（比如用户在问群里另一个人），可以主动放弃回复。只在智能唤醒时生效。"
+  },
+  "reject_tool_scopes": {
+    "description": "拒绝回复适用的唤醒方式",
+    "type": "list",
+    "options": ["probability", "bored", "interest", "similarity", "persona_name", "ask"],
+    "default": ["probability", "bored", "interest", "similarity"],
+    "hint": "勾选哪些唤醒方式允许 Bot 主动放弃回复（probability=概率、bored=无聊、interest=兴趣、similarity=相关性、persona_name=人格名、ask=答疑）"
   }
 }
