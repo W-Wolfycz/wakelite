@@ -1,7 +1,7 @@
 name: wakelite
 display_name: 轻量唤醒
 author: wolfycz
-version: 1.3.1
+version: 1.3.2
 description: 轻量唤醒插件，6 个唤醒源（人格名/概率/答疑/无聊/兴趣/相关性）+ 群白名单 + 会话级唤醒 CD + 复读过滤 + 多 bot 分流，支持唤醒后让 LLM 主动拒绝回复。
 repo: https://github.com/W-Wolfycz/wakelite
 astrbot_version: ">=4.16,<5"

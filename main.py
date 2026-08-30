@@ -119,33 +119,29 @@ class WakeLitePlugin(Star):
         # 旧 log_config 组由 AstrBot 按新 schema 在加载前自动清理，插件不写迁移。
         self.log_with_bot_id = bool(config.get("log_with_bot_id", True))
 
-        # 多 bot 分流：每项 "platform_id:self_id" 字符串
-        bots_raw = config.get("bots", []) or []
-        if not isinstance(bots_raw, (list, tuple)):
-            bots_raw = []
-        self.bots: list[tuple[str, str]] = []
-        self.bots_index: dict[tuple[str, str], int] = {}
-        for entry in bots_raw:
+        # 多 bot 分流（按群）：每项 "self_id" 或 "self_id:group_id"；
+        # 单段或冒号后为空 = 该 bot 在所有群参与分流。旧 bots 配置不再读取。
+        group_bots_raw = config.get("group_bots", []) or []
+        if not isinstance(group_bots_raw, (list, tuple)):
+            group_bots_raw = []
+        self.group_bots: list[tuple[str, str]] = []
+        self.group_bots_index: dict[tuple[str, str], int] = {}
+        for entry in group_bots_raw:
             s = entry.strip() if isinstance(entry, str) else ""
             if not s:
                 continue
-            if ":" not in s:
+            sid, _, gid = s.partition(":")
+            sid, gid = sid.strip(), gid.strip()
+            if not sid:
                 logger.warning(
-                    f"{self._log_prefix()} bots 配置项格式错误（应为 platform_id:self_id）：{s}"
+                    f"{self._log_prefix()} group_bots 配置项格式错误：{s}"
                 )
                 continue
-            pid, sid = s.split(":", 1)
-            pid, sid = pid.strip(), sid.strip()
-            if not (pid and sid):
-                logger.warning(
-                    f"{self._log_prefix()} bots 配置项字段不能为空：{s}"
-                )
-                continue
-            key = (pid, sid)
-            if key in self.bots_index:
+            key = (sid, gid)
+            if key in self.group_bots_index:
                 continue  # 去重
-            self.bots_index[key] = len(self.bots)
-            self.bots.append(key)
+            self.group_bots_index[key] = len(self.group_bots)
+            self.group_bots.append(key)
 
         self.persona_mgr = context.persona_manager
         self.conv_mgr = context.conversation_manager
@@ -171,7 +167,7 @@ class WakeLitePlugin(Star):
             f"相关性={self.similar_threshold}, CD={self.wake_cd}s, "
             f"白名单群={len(self.whitelist_groups)}个, "
             f"兴趣关键词包={len(self.interest_words)}个, "
-            f"分流bots={len(self.bots)}个, "
+            f"分群bot配置={len(self.group_bots)}条, "
             f"使用chat_memory={self.use_chat_memory}, "
             f"历史范围={self.history_scope}, "
             f"拒绝回复工具={self.enable_reject_tool}"
@@ -432,41 +428,50 @@ class WakeLitePlugin(Star):
         return int(hashlib.md5(key.encode("utf-8")).hexdigest()[:8], 16)
 
     def _compute_my_turn(self, event: AstrMessageEvent, uid: str, bid: str) -> bool:
-        """当前 bot 是否轮到跑阈值/概率类判定（多 bot 分流）。
+        """当前 bot 是否轮到跑阈值/概率类判定（多 bot 按群分流）。
 
-        未配置 bots → True；当前 bot 不在列表 → False；
-        用户消息 → 全部 bots 池；bot 消息 → 除去发送者的池。
+        未配置 group_bots → True；当前群的分流池 = 配置中「所有群启用 + 本群
+        显式启用」的 bot（按配置顺序去重）；本 bot 不在池 → False；
+        bot 消息 → 池内排除发送者后哈希取模。
         """
-        if not self.bots:
+        if not self.group_bots:
             return True
 
-        my_pid = event.get_platform_id()
-        my_key = (my_pid, bid)
-        if my_key not in self.bots_index:
+        gid = str(event.get_group_id() or "")
+        active: list[str] = []
+        active_set: set[str] = set()
+        for sid, group in self.group_bots:
+            if sid in active_set:
+                continue
+            if group and group != gid:
+                continue
+            active_set.add(sid)
+            active.append(sid)
+
+        if bid not in active_set:
             self._log(
-                f"({my_pid}, {bid}) 不在 bots 列表，跳过阈值分流",
+                f"{bid} 不在当前群的分流列表，跳过阈值分流",
                 event=event,
             )
             return False
 
-        sender_key = (my_pid, uid)
-        if sender_key in self.bots_index:
-            # 情况 2：bot 消息，原列表除去发送者
-            active = [k for k in self.bots if k != sender_key]
+        if uid in active_set:
+            # bot 消息：池内排除发送者
+            pool = [s for s in active if s != uid]
         else:
-            # 情况 1：用户消息，全部 bots
-            active = self.bots
+            # 用户消息：全部池内 bot
+            pool = active
 
-        if not active:
+        if not pool:
             return False
 
         try:
-            my_pos = active.index(my_key)
+            my_pos = pool.index(bid)
         except ValueError:
             return False
 
         h = self._stable_hash(event)
-        return h % len(active) == my_pos
+        return h % len(pool) == my_pos
 
     # ===================== Hook =====================
 

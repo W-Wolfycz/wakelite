@@ -11,11 +11,11 @@
     "default": [],
     "hint": "每行填一个群号。只有列表里的群才生效；留空 = 所有群都不处理。保存后立即生效。"
   },
-  "bots": {
-    "description": "多 bot 分流",
+  "group_bots": {
+    "description": "多 bot 分流（按群）",
     "type": "list",
     "default": [],
-    "hint": "多 Bot 共用配置时使用：每行填一个 Bot 实例（平台实例ID:机器人自身ID），同一条消息只会有一个 Bot 响应，避免重复抢答。留空关闭。"
+    "hint": "每行一个 Bot 实例：只填机器人自身ID = 该 Bot 在所有群参与分流；「机器人自身ID:群号」= 仅在该群参与分流。同一个群配置多个 Bot 时按消息哈希轮流响应，避免抢答；单 Bot 群会 100% 响应。留空关闭分流。"
   },
   "use_chat_memory": {
     "description": "启用 chat_memory 数据源",

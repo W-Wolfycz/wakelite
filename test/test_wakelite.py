@@ -731,15 +731,41 @@ class AdapterLogicTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[2], "10002")
 
     def test_compute_my_turn_bot_sender_excluded_from_pool(self):
-        plugin = make_plugin(bots=["BOT1:10001", "BOT2:10002"])
-        event = Event()  # 本 bot 为 BOT1:10001，消息来自 BOT2:10002
-        # 活跃池排除发送者后只剩自己，hash % 1 == 0 恒真 → 轮到自己
+        plugin = make_plugin(group_bots=["10001", "10002"])
+        event = Event()  # 本 bot 10001，消息来自池内 bot 10002
+        # 池=[10001,10002]，排除发送者后只剩自己，hash % 1 == 0 → 轮到自己
         self.assertTrue(plugin._compute_my_turn(event, "10002", "10001"))
 
     def test_compute_my_turn_single_bot_sender_leaves_empty_pool(self):
-        plugin = make_plugin(bots=["BOT1:10001"])
+        plugin = make_plugin(group_bots=["10001"])
         event = Event()
         self.assertFalse(plugin._compute_my_turn(event, "10001", "10001"))
+
+    def test_group_bots_parse_forms(self):
+        plugin = make_plugin(
+            group_bots=["10001", "10002:", "10003:123456789"]
+        )
+        self.assertIn(("10001", ""), plugin.group_bots)
+        self.assertIn(("10002", ""), plugin.group_bots)
+        self.assertIn(("10003", "123456789"), plugin.group_bots)
+
+    def test_group_bots_ignore_invalid_entries(self):
+        plugin = make_plugin(group_bots=[":group_demo", "   ", 123])
+        self.assertEqual(plugin.group_bots, [])
+
+    def test_group_entry_scoped_to_its_group(self):
+        plugin = make_plugin(group_bots=["10001:group_demo"])
+        event = Event()  # gid=group_demo，用户消息
+        self.assertTrue(plugin._compute_my_turn(event, "10002", "10001"))
+        other = Event()
+        other.group_id = "other_group"
+        self.assertFalse(plugin._compute_my_turn(other, "10002", "10001"))
+
+    def test_global_entry_applies_to_any_group(self):
+        plugin = make_plugin(group_bots=["10001"])
+        event = Event()
+        event.group_id = "other_group"
+        self.assertTrue(plugin._compute_my_turn(event, "10002", "10001"))
 
 
 class LogConfigTests(unittest.TestCase):
