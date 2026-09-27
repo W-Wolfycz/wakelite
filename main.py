@@ -21,10 +21,11 @@ _CTX_CLEAN_RE = re.compile(r"</?(?:think|reasoning|analysis)>", re.IGNORECASE)
 
 _WAKE_HINT_INTROS = {
     "persona_name": "消息提到了当前生效的人格名，因此触发了人格名唤醒。",
+    "keyword": "消息命中了配置的关键词，因此触发了关键词唤醒。",
     "probability": "本轮通过概率信号被唤醒。",
     "ask": "本轮通过答疑信号被唤醒。",
     "bored": "本轮通过无聊信号被唤醒。",
-    "interest": "本轮通过兴趣关键词信号被唤醒。",
+    "interest": "本轮通过兴趣词包信号被唤醒。",
     "similarity": "本轮通过与近期回复的相关性信号被唤醒。",
 }
 
@@ -38,9 +39,9 @@ _REJECT_TOOL_DESCRIPTION = (
     "只有当你确实应该回答、或用户明显在对你提问时才不要调用。"
 )
 
-# 拒绝工具默认注入范围：仅弱信号唤醒（概率/无聊/兴趣/相关性）；
+# 拒绝工具默认注入范围：仅弱信号唤醒（概率/关键词/无聊/兴趣/相关性）；
 # 强信号（人格名/答疑）默认不注入，被点名或用户在提问时拒绝体验很差
-_REJECT_DEFAULT_SCOPES = ("probability", "bored", "interest", "similarity")
+_REJECT_DEFAULT_SCOPES = ("probability", "keyword", "bored", "interest", "similarity")
 
 
 # 历史条数上限的硬上限：取消过期时间后条数上限是唯一窗口控制，防止误填过大
@@ -115,6 +116,15 @@ class WakeLitePlugin(Star):
             for s in interest_words_str
             if isinstance(s, str)
         ]
+        self.keyword_prob = _clamp_float(config.get("keyword_prob", 0.5), 0.5, 0.0, 1.0)
+        keyword_words_raw = config.get("keyword_words", []) or []
+        if not isinstance(keyword_words_raw, (list, tuple)):
+            keyword_words_raw = []
+        self.keyword_words: list[str] = [
+            w.strip().lower()
+            for w in keyword_words_raw
+            if isinstance(w, str) and w.strip()
+        ]
         # 日志前缀附加机器人 ID（顶层配置）；日志等级由 WebUI 插件详情页调整。
         # 旧 log_config 组由 AstrBot 按新 schema 在加载前自动清理，插件不写迁移。
         self.log_with_bot_id = bool(config.get("log_with_bot_id", True))
@@ -166,7 +176,8 @@ class WakeLitePlugin(Star):
             f"无聊={self.bored_threshold}, 兴趣={self.interest_threshold}, "
             f"相关性={self.similar_threshold}, CD={self.wake_cd}s, "
             f"白名单群={len(self.whitelist_groups)}个, "
-            f"兴趣关键词包={len(self.interest_words)}个, "
+            f"兴趣词包={len(self.interest_words)}个, "
+            f"关键词唤醒={self.keyword_prob}({len(self.keyword_words)}词), "
             f"分群bot配置={len(self.group_bots)}条, "
             f"使用chat_memory={self.use_chat_memory}, "
             f"历史范围={self.history_scope}, "
@@ -350,9 +361,8 @@ class WakeLitePlugin(Star):
     def _log_prefix(self, event: AstrMessageEvent | None = None) -> str:
         if self.log_with_bot_id and event is not None:
             try:
-                sid = event.get_self_id()
-                # 模块名段 + bot 标识段并存，禁止用 bot 标识替换整个前缀
-                return f"[WakeLite][bot-{sid}]"
+                # 统一格式：模块名段 + platform_id 段并存
+                return f"[WakeLite][platform:{event.get_platform_id()}]"
             except Exception:
                 pass
         return "[WakeLite]"
@@ -608,17 +618,32 @@ class WakeLitePlugin(Star):
                     event=event,
                 )
 
-        # 下面 5 项受多 bot 分流影响：未轮到我则跳过
+        # 下面 6 项受多 bot 分流影响：未轮到我则跳过
         if not is_my_turn:
             self._log(f"非本 bot 分流轮次 uid={uid} 跳过阈值判定", event=event)
             return
 
-        # 2. 概率唤醒
+        # 2. 关键词唤醒（命中任一关键词后按概率）
+        if self.keyword_prob > 0 and self.keyword_words:
+            plain_lower = plain.lower()
+            hit = next((w for w in self.keyword_words if w in plain_lower), None)
+            if hit is not None:
+                if random.random() < self.keyword_prob:
+                    self._log(f"关键词命中 umo={umo} keyword={hit}", event=event)
+                    self._wake(event, uid, now,
+                               f"关键词唤醒 umo={umo}", source="keyword")
+                    return
+                self._log(
+                    f"关键词命中但概率未过 umo={umo} keyword={hit}",
+                    event=event,
+                )
+
+        # 3. 概率唤醒
         if self.prob > 0 and random.random() < self.prob:
             self._wake(event, uid, now, f"概率唤醒 umo={umo}", source="probability")
             return
 
-        # 3. 答疑唤醒
+        # 4. 答疑唤醒
         if self.ask_threshold < 1:
             try:
                 score = sentiment.ask(plain)
@@ -630,7 +655,7 @@ class WakeLitePlugin(Star):
                            f"答疑唤醒 umo={umo} score={score:.3f}", source="ask")
                 return
 
-        # 4. 无聊唤醒
+        # 5. 无聊唤醒
         if self.bored_threshold < 1:
             try:
                 score = sentiment.bored(plain)
@@ -642,7 +667,7 @@ class WakeLitePlugin(Star):
                            f"无聊唤醒 umo={umo} score={score:.3f}", source="bored")
                 return
 
-        # 5. 兴趣唤醒
+        # 6. 兴趣唤醒
         if self.interest_threshold < 1 and self.interest_words:
             try:
                 score = self.interest.calc_interest(plain)
@@ -654,7 +679,7 @@ class WakeLitePlugin(Star):
                            f"兴趣唤醒 umo={umo} score={score:.3f}", source="interest")
                 return
 
-        # 6. 相关性唤醒（仅比对 LLM 回复，带时间衰减）
+        # 7. 相关性唤醒（仅比对 LLM 回复，带时间衰减）
         if self.similar_threshold < 1 and similarity_msgs:
             try:
                 sim = self.similarity.similarity(

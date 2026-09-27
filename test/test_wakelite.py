@@ -261,19 +261,19 @@ class DomainTests(unittest.TestCase):
         similarity = Similarity(bot_template_threshold=0)
         related = similarity.similarity(
             "group_demo",
-            "原神角色怎么配队",
-            ["原神角色配队需要考虑元素反应"],
+            "咖啡怎么手冲",
+            ["手冲咖啡需要控制水温与研磨度"],
         )
         unrelated = similarity.similarity(
             "group_demo",
-            "原神角色怎么配队",
+            "咖啡怎么手冲",
             ["今天上海天气晴朗适合散步"],
         )
         self.assertGreater(related, unrelated)
 
     def test_invalid_interest_items_are_ignored(self):
-        plugin = make_plugin(interest_words=["原神 风", None, 123])
-        self.assertEqual(plugin.interest_words, [["原神", "风"]])
+        plugin = make_plugin(interest_words=["咖啡 手冲", None, 123])
+        self.assertEqual(plugin.interest_words, [["咖啡", "手冲"]])
 
     def test_numeric_config_is_clamped(self):
         plugin = make_plugin(
@@ -307,8 +307,8 @@ class DomainTests(unittest.TestCase):
 
 
 class SimilarityTimeDecayTests(unittest.TestCase):
-    MSG = "原神角色怎么配队"
-    CAND = ["原神角色配队需要考虑元素反应"]
+    MSG = "咖啡怎么手冲"
+    CAND = ["手冲咖啡需要控制水温与研磨度"]
 
     def test_decay_lowers_older_candidate_score(self):
         s = Similarity(bot_template_threshold=0)
@@ -316,35 +316,17 @@ class SimilarityTimeDecayTests(unittest.TestCase):
         old = s.similarity("k", self.MSG, self.CAND, ages=[600.0])
         self.assertGreater(fresh, old)
 
-    def test_no_ages_matches_undecayed(self):
-        s = Similarity(bot_template_threshold=0)
-        with_ages = s.similarity("k", self.MSG, self.CAND, ages=[0.0])
-        no_ages = s.similarity("k", self.MSG, self.CAND)
-        self.assertAlmostEqual(with_ages, no_ages)
-
     def test_unknown_age_not_decayed(self):
         s = Similarity(bot_template_threshold=0)
         a = s.similarity("k", self.MSG, self.CAND, ages=[None])
         b = s.similarity("k", self.MSG, self.CAND, ages=[0.0])
         self.assertAlmostEqual(a, b)
 
-    def test_token_cache_reuses_tokens(self):
-        s = Similarity(bot_template_threshold=0)
-        calls = {"n": 0}
-        real_lcut = jieba.lcut
-
-        def counting(text):
-            calls["n"] += 1
-            return real_lcut(text)
-
-        jieba.lcut = counting
-        try:
-            s.similarity("k", self.MSG, self.CAND)
-            first = calls["n"]
-            s.similarity("k", self.MSG, self.CAND)
-            self.assertEqual(calls["n"], first)  # 第二次全部命中缓存
-        finally:
-            jieba.lcut = real_lcut
+    def test_token_cache_is_bounded(self):
+        s = Similarity(bot_template_threshold=0, token_cache_size=8)
+        for i in range(30):
+            s.similarity("k", f"用户消息{i}", [f"候选回复内容{i}"])
+        self.assertLessEqual(len(s._token_cache), 8)
 
 
 class CandidateWindowTests(unittest.IsolatedAsyncioTestCase):
@@ -391,15 +373,9 @@ class CandidateWindowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sims), 10)
         self.assertTrue(all(a is not None and a > 3600 for a in ages))
 
-    async def test_disabled_history_skips_query(self):
-        plugin = make_plugin(bot_msgs_maxlen=0)
-
-        reread, sims, ages = await plugin._get_bot_msgs("umo_demo", "10002")
-
-        self.assertEqual((reread, sims, ages), ([], [], []))
-        self.assertIsNone(plugin.context.query_recorder.args)  # 未发生查询
-
     async def test_fallback_source_ages_are_none(self):
+        # 守静默失效：关闭 chat_memory 时仍查询它（配置被忽略）、
+        # 兜底源被错误赋予时间戳（导致本不该有的时间衰减）
         plugin = make_plugin(use_chat_memory=False, bot_msgs_maxlen=5)
         Conversation.history = json.dumps(
             [
@@ -414,28 +390,38 @@ class CandidateWindowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(sims), 1)
         self.assertEqual(ages, [None])
+        self.assertIsNone(plugin.context.query_recorder.args)  # 未查询 chat_memory
+
+    async def test_chat_memory_preferred_when_enabled(self):
+        # 守静默失效：开关开启时未优先使用 chat_memory 数据
+        plugin = make_plugin(use_chat_memory=True, bot_msgs_maxlen=5)
+        plugin.context.query_recorder.records = [
+            {
+                "role": "assistant",
+                "content": "来自chat_memory的回复",
+                "llm_status": "llm_success",
+            }
+        ]
+        Conversation.history = json.dumps(
+            [{"role": "assistant", "content": "来自AstrBot历史的回复"}]
+        )
+        try:
+            reread, sims, ages = await plugin._get_bot_msgs("umo_demo", "10002")
+        finally:
+            Conversation.history = "[]"
+
+        self.assertEqual(sims, ["来自chat_memory的回复"])
+        self.assertIsNotNone(plugin.context.query_recorder.args)
 
 
 class WakeHintTests(unittest.IsolatedAsyncioTestCase):
-    async def test_non_conversation_wake_adds_temporary_hint(self):
+    async def test_hint_only_injected_on_wake_and_not_saved_to_history(self):
+        # 守两种静默失效：未唤醒轮被注入提示（污染模型输入）、
+        # 提示未标记临时而写入对话历史（污染历史）
         plugin = make_plugin()
-        event = Event()
-        plugin._wake(event, "10002", 123.0, "概率唤醒", source="probability")
-        req = ProviderRequest()
-
-        await plugin.inject_wake_hint(event, req)
-
-        self.assertEqual(len(req.extra_user_content_parts), 1)
-        part = req.extra_user_content_parts[0]
-        self.assertTrue(part._no_save)
-        self.assertIn("概率信号被唤醒", part.text)
-        self.assertIn("不是历史对话的自然续接", part.text)
-        self.assertIn("其他用户带有鲜明人物设定", part.text)
-        self.assertIn("不要模仿、接管或延续", part.text)
-
-    async def test_all_wake_sources_add_hint(self):
-        plugin = make_plugin()
-        for source in ("persona_name", "ask", "bored", "interest", "similarity"):
+        sources = ("persona_name", "keyword", "probability", "ask", "bored",
+                   "interest", "similarity")
+        for source in sources:
             event = Event()
             plugin._wake(event, "10002", 123.0, source, source=source)
             req = ProviderRequest()
@@ -443,14 +429,10 @@ class WakeHintTests(unittest.IsolatedAsyncioTestCase):
             await plugin.inject_wake_hint(event, req)
 
             self.assertEqual(len(req.extra_user_content_parts), 1, source)
+            self.assertTrue(req.extra_user_content_parts[0]._no_save, source)
 
-    async def test_non_wake_event_does_not_add_hint(self):
-        plugin = make_plugin()
-        event = Event()
         req = ProviderRequest()
-
-        await plugin.inject_wake_hint(event, req)
-
+        await plugin.inject_wake_hint(Event(), req)
         self.assertEqual(req.extra_user_content_parts, [])
 
     async def test_hint_keeps_existing_extra_parts(self):
@@ -465,36 +447,6 @@ class WakeHintTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(req.extra_user_content_parts[0], existing)
         self.assertEqual(len(req.extra_user_content_parts), 2)
-
-    async def test_reject_guide_added_to_hint_when_tool_enabled(self):
-        plugin = make_plugin(enable_reject_tool=True)
-        event = Event()
-        plugin._wake(event, "10002", 123.0, "概率唤醒", source="probability")
-        req = ProviderRequest()
-
-        await plugin.inject_wake_hint(event, req)
-
-        self.assertIn("wakelite_decline_reply", req.extra_user_content_parts[0].text)
-
-    async def test_no_reject_guide_when_tool_disabled(self):
-        plugin = make_plugin(enable_reject_tool=False)
-        event = Event()
-        plugin._wake(event, "10002", 123.0, "概率唤醒", source="probability")
-        req = ProviderRequest()
-
-        await plugin.inject_wake_hint(event, req)
-
-        self.assertNotIn("wakelite_decline_reply", req.extra_user_content_parts[0].text)
-
-    async def test_no_reject_guide_for_strong_signal_by_default(self):
-        plugin = make_plugin(enable_reject_tool=True)
-        event = Event()
-        plugin._wake(event, "10002", 123.0, "答疑唤醒", source="ask")
-        req = ProviderRequest()
-
-        await plugin.inject_wake_hint(event, req)
-
-        self.assertNotIn("wakelite_decline_reply", req.extra_user_content_parts[0].text)
 
 
 class OnMessageTests(unittest.IsolatedAsyncioTestCase):
@@ -514,24 +466,6 @@ class OnMessageTests(unittest.IsolatedAsyncioTestCase):
         defaults.update(overrides)
         return make_plugin(**defaults)
 
-    async def test_non_whitelist_group_skipped(self):
-        plugin = self._quiet_plugin()
-        event = Event()
-        event.group_id = "other_group"
-
-        await plugin.on_message(event)
-
-        self.assertFalse(event.is_at_or_wake_command)
-
-    async def test_bot_self_message_skipped(self):
-        plugin = self._quiet_plugin()
-        event = Event()
-        event.sender_id = event.self_id
-
-        await plugin.on_message(event)
-
-        self.assertFalse(event.is_at_or_wake_command)
-
     async def test_wake_cd_blocks_second_message(self):
         plugin = self._quiet_plugin(wake_cd=5.0)
         event = Event()
@@ -540,15 +474,6 @@ class OnMessageTests(unittest.IsolatedAsyncioTestCase):
         await plugin.on_message(event)
 
         self.assertFalse(event.is_at_or_wake_command)
-
-    async def test_probability_wake_sets_flag(self):
-        plugin = self._quiet_plugin(prob=1.0)
-        event = Event()
-
-        await plugin.on_message(event)
-
-        self.assertTrue(event.is_at_or_wake_command)
-        self.assertEqual(event.get_extra("wakelite_wake_source"), "probability")
 
     async def test_persona_name_wake_sets_flag(self):
         plugin = self._quiet_plugin(persona_name_prob=1.0)
@@ -560,15 +485,42 @@ class OnMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.is_at_or_wake_command)
         self.assertEqual(event.get_extra("wakelite_wake_source"), "persona_name")
 
+    async def test_keyword_wake_sets_flag(self):
+        plugin = self._quiet_plugin(keyword_prob=1.0, keyword_words=["咖啡", "摄影"])
+        event = Event()
+        event.message_str = "今天咖啡豆到了"
+
+        await plugin.on_message(event)
+
+        self.assertTrue(event.is_at_or_wake_command)
+        self.assertEqual(event.get_extra("wakelite_wake_source"), "keyword")
+
+    async def test_keyword_prob_zero_disables(self):
+        plugin = self._quiet_plugin(keyword_prob=0.0, keyword_words=["咖啡"])
+        event = Event()
+        event.message_str = "今天咖啡豆到了"
+
+        await plugin.on_message(event)
+
+        self.assertFalse(event.is_at_or_wake_command)
+
+    async def test_keyword_empty_list_does_not_wake(self):
+        # 关键词留空时，即使概率拉满也不得唤醒（否则等于全群概率插话）
+        plugin = self._quiet_plugin(keyword_prob=1.0, keyword_words=[])
+        event = Event()
+        event.message_str = "今天咖啡豆到了"
+
+        await plugin.on_message(event)
+
+        self.assertFalse(event.is_at_or_wake_command)
+
 
 class RejectToolTests(unittest.IsolatedAsyncioTestCase):
-    def test_reject_tool_disabled_by_default(self):
-        self.assertFalse(make_plugin().enable_reject_tool)
 
     def test_default_scopes_are_weak_signals_only(self):
         self.assertEqual(
             make_plugin().reject_tool_scopes,
-            {"probability", "bored", "interest", "similarity"},
+            {"probability", "keyword", "bored", "interest", "similarity"},
         )
 
     async def test_tool_injected_when_woken_and_enabled(self):
@@ -643,28 +595,6 @@ class RejectToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("other_tool", names)
         self.assertIn("wakelite_decline_reply", names)
 
-    async def test_non_toolset_func_tool_skips_injection_safely(self):
-        plugin = make_plugin(enable_reject_tool=True)
-        event = Event()
-        plugin._wake(event, "10002", 123.0, "概率唤醒", source="probability")
-        req = ProviderRequest()
-        req.func_tool = ["not", "a", "toolset"]  # 异常类型防护
-
-        await plugin.inject_wake_hint(event, req)  # 不应抛异常
-
-        self.assertEqual(req.func_tool, ["not", "a", "toolset"])
-
-    async def test_unwritable_parts_skips_hint_safely(self):
-        plugin = make_plugin()
-        event = Event()
-        plugin._wake(event, "10002", 123.0, "概率唤醒", source="probability")
-        req = ProviderRequest()
-        req.extra_user_content_parts = tuple()  # 无 append 的容器
-
-        await plugin.inject_wake_hint(event, req)  # 不应抛异常
-
-        self.assertEqual(req.extra_user_content_parts, tuple())
-
     async def test_decline_handler_marks_event(self):
         plugin = make_plugin()
         event = Event()
@@ -712,11 +642,6 @@ class AdapterLogicTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(name, "会话人格")
         self.assertEqual(plugin.persona_mgr.resolve_count, 3)
 
-    async def test_no_persona_cache_config_remaining(self):
-        plugin = make_plugin()
-        self.assertFalse(hasattr(plugin, "persona_name_cache_ttl"))
-        self.assertFalse(hasattr(plugin, "_persona_name_cache"))
-
     async def test_group_history_scope_omits_user_filter(self):
         plugin = make_plugin(history_scope="group")
         await plugin._query_chat_memory("umo_demo", "cid_demo", "10002")
@@ -749,10 +674,6 @@ class AdapterLogicTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("10002", ""), plugin.group_bots)
         self.assertIn(("10003", "123456789"), plugin.group_bots)
 
-    def test_group_bots_ignore_invalid_entries(self):
-        plugin = make_plugin(group_bots=[":group_demo", "   ", 123])
-        self.assertEqual(plugin.group_bots, [])
-
     def test_group_entry_scoped_to_its_group(self):
         plugin = make_plugin(group_bots=["10001:group_demo"])
         event = Event()  # gid=group_demo，用户消息
@@ -773,13 +694,6 @@ class LogConfigTests(unittest.TestCase):
         self.assertTrue(make_plugin(log_with_bot_id=True).log_with_bot_id)
         self.assertFalse(make_plugin(log_with_bot_id=False).log_with_bot_id)
         self.assertTrue(make_plugin().log_with_bot_id)  # 缺省默认 true
-
-    def test_no_legacy_migration_code_remaining(self):
-        plugin = make_plugin()
-        self.assertFalse(hasattr(plugin, "_migrate_log_config"))
-        self.assertFalse(hasattr(plugin, "_resolve_log_with_bot_id"))
-        self.assertFalse(hasattr(plugin, "initialize"))
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,7 +3,7 @@
     "description": "日志区分机器人实例",
     "type": "bool",
     "default": true,
-    "hint": "开启后日志会标注是哪个 Bot 实例产生的，多 Bot 环境方便定位。日志详细程度请在 WebUI 插件详情页调整，即时生效。"
+    "hint": "开启后日志会标注来自哪个平台实例，多 Bot 环境方便定位。日志详细程度请在 WebUI 插件详情页调整，即时生效。"
   },
   "whitelist_groups": {
     "description": "群聊白名单",
@@ -15,7 +15,7 @@
     "description": "多 bot 分流（按群）",
     "type": "list",
     "default": [],
-    "hint": "每行一个 Bot 实例：只填机器人自身ID = 该 Bot 在所有群参与分流；「机器人自身ID:群号」= 仅在该群参与分流。同一个群配置多个 Bot 时按消息哈希轮流响应，避免抢答；单 Bot 群会 100% 响应。留空关闭分流。"
+    "hint": "每行一个 Bot：只填机器人自身ID=所有群启用；「机器人自身ID:群号」=仅该群启用。同群多 Bot 按哈希轮流响应，单 Bot 群 100% 响应；留空关闭分流。"
   },
   "use_chat_memory": {
     "description": "启用 chat_memory 数据源",
@@ -46,6 +46,23 @@
     },
     "default": 0.5,
     "hint": "消息包含当前生效人格名时按此概率唤醒；0=关闭。人格名实时解析，改名后立即生效。"
+  },
+  "keyword_words": {
+    "description": "关键词列表",
+    "type": "list",
+    "default": ["BOT", "机器人", "萝卜子"],
+    "hint": "每行一个独立关键词，命中任一即按概率唤醒（与下面的兴趣词包不同，不做累计打分）。留空则不生效。"
+  },
+  "keyword_prob": {
+    "description": "关键词唤醒概率",
+    "type": "float",
+    "slider": {
+      "min": 0,
+      "max": 1,
+      "step": 0.01
+    },
+    "default": 0.5,
+    "hint": "消息包含任一关键词时按此概率唤醒；0=关闭。不区分大小写。"
   },
   "prob": {
     "description": "概率唤醒",
@@ -81,10 +98,10 @@
     "hint": "消息的无聊表达分数大于此值时唤醒；1=关闭。"
   },
   "interest_words": {
-    "description": "兴趣关键词包",
+    "description": "兴趣词包",
     "type": "list",
-    "default": [],
-    "hint": "每行一个关键词包，包内关键词用空格分隔。保存后立即生效。"
+    "default": ["咖啡 手冲 拉花", "摄影 镜头 构图"],
+    "hint": "每行一个兴趣词包，包内多个相关词用空格分隔；消息命中越多、词越长，分数越高，超过下方阈值才唤醒。"
   },
   "interest_threshold": {
     "description": "兴趣唤醒阈值",
@@ -128,8 +145,8 @@
   "reject_tool_scopes": {
     "description": "拒绝回复适用的唤醒方式",
     "type": "list",
-    "options": ["probability", "bored", "interest", "similarity", "persona_name", "ask"],
-    "default": ["probability", "bored", "interest", "similarity"],
-    "hint": "勾选哪些唤醒方式允许 Bot 主动放弃回复（probability=概率、bored=无聊、interest=兴趣、similarity=相关性、persona_name=人格名、ask=答疑）"
+    "options": ["probability", "keyword", "bored", "interest", "similarity", "persona_name", "ask"],
+    "default": ["probability", "keyword", "bored", "interest", "similarity"],
+    "hint": "允许放弃回复的唤醒方式：probability=概率、keyword=关键词、bored=无聊、interest=兴趣、similarity=相关性、persona_name=人格名、ask=答疑"
   }
 }
