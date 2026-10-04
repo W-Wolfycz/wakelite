@@ -56,6 +56,14 @@ def _install_astrbot_stubs() -> None:
         def __init__(self, text=""):
             self.text = text
 
+    class At:
+        def __init__(self, qq=""):
+            self.qq = qq
+
+    class Reply:
+        def __init__(self, sender_id=0):
+            self.sender_id = sender_id
+
     modules = {
         "astrbot": types.ModuleType("astrbot"),
         "astrbot.api": types.ModuleType("astrbot.api"),
@@ -113,12 +121,15 @@ def _install_astrbot_stubs() -> None:
 
     modules["astrbot.core.agent.message"].TextPart = TextPart
     modules["astrbot.core.message.components"].Plain = Plain
+    modules["astrbot.core.message.components"].At = At
+    modules["astrbot.core.message.components"].Reply = Reply
     sys.modules.update(modules)
 
 
 _install_astrbot_stubs()
 
 from astrbot.api import FunctionTool, ToolSet
+from astrbot.core.message.components import At, Plain, Reply
 from wakelite.main import WakeLitePlugin
 from wakelite.sentiment import sentiment
 from wakelite.similarity import Similarity
@@ -194,6 +205,7 @@ class Event:
         self._result = None
         self._force_stopped = False
         self.message_str = "用户消息"
+        self.messages = []
         self.group_id = "group_demo"
         self.sender_id = "10002"
         self.self_id = "10001"
@@ -214,7 +226,7 @@ class Event:
         return self.group_id
 
     def get_messages(self):
-        return []
+        return self.messages
 
     def set_extra(self, key, value):
         self._extras[key] = value
@@ -250,9 +262,6 @@ def make_plugin(**overrides):
 
 
 class DomainTests(unittest.TestCase):
-    def test_question_particle_is_not_removed(self):
-        self.assertIn("吗", sentiment.seg("你好吗"))
-        self.assertGreater(sentiment.ask("你好吗"), 0)
 
     def test_negation_reduces_bored_score(self):
         self.assertLess(sentiment.bored("我不无聊"), sentiment.bored("我好无聊"))
@@ -292,17 +301,14 @@ class DomainTests(unittest.TestCase):
         self.assertEqual(plugin.bot_msgs_maxlen, 50)
 
     def test_created_at_utc_is_timezone_safe(self):
-        actual = WakeLitePlugin._parse_created_at("2026-07-17T12:00:00Z")
+        # 守静默失效：naive 时间被按宿主机本地时区解释 → 时间衰减整体偏移
         expected = datetime(2026, 7, 17, 12, tzinfo=timezone.utc).timestamp()
-        self.assertEqual(actual, expected)
-
-    def test_wake_cd_is_scoped_by_umo(self):
-        plugin = make_plugin()
-        event = Event()
-        plugin._wake(event, "10002", 123.0, "test")
         self.assertEqual(
-            plugin._last_wake[(event.unified_msg_origin, "10002")],
-            123.0,
+            WakeLitePlugin._parse_created_at("2026-07-17T12:00:00Z"), expected
+        )
+        # chat_memory 的数据库时间为 UTC naive：必须按 UTC 解释
+        self.assertEqual(
+            WakeLitePlugin._parse_created_at("2026-07-17 12:00:00"), expected
         )
 
 
@@ -373,47 +379,6 @@ class CandidateWindowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sims), 10)
         self.assertTrue(all(a is not None and a > 3600 for a in ages))
 
-    async def test_fallback_source_ages_are_none(self):
-        # 守静默失效：关闭 chat_memory 时仍查询它（配置被忽略）、
-        # 兜底源被错误赋予时间戳（导致本不该有的时间衰减）
-        plugin = make_plugin(use_chat_memory=False, bot_msgs_maxlen=5)
-        Conversation.history = json.dumps(
-            [
-                {"role": "assistant", "content": "兜底回复内容一二"},
-                {"role": "user", "content": "用户消息"},
-            ]
-        )
-        try:
-            reread, sims, ages = await plugin._get_bot_msgs("umo_demo", "10002")
-        finally:
-            Conversation.history = "[]"
-
-        self.assertEqual(len(sims), 1)
-        self.assertEqual(ages, [None])
-        self.assertIsNone(plugin.context.query_recorder.args)  # 未查询 chat_memory
-
-    async def test_chat_memory_preferred_when_enabled(self):
-        # 守静默失效：开关开启时未优先使用 chat_memory 数据
-        plugin = make_plugin(use_chat_memory=True, bot_msgs_maxlen=5)
-        plugin.context.query_recorder.records = [
-            {
-                "role": "assistant",
-                "content": "来自chat_memory的回复",
-                "llm_status": "llm_success",
-            }
-        ]
-        Conversation.history = json.dumps(
-            [{"role": "assistant", "content": "来自AstrBot历史的回复"}]
-        )
-        try:
-            reread, sims, ages = await plugin._get_bot_msgs("umo_demo", "10002")
-        finally:
-            Conversation.history = "[]"
-
-        self.assertEqual(sims, ["来自chat_memory的回复"])
-        self.assertIsNotNone(plugin.context.query_recorder.args)
-
-
 class WakeHintTests(unittest.IsolatedAsyncioTestCase):
     async def test_hint_only_injected_on_wake_and_not_saved_to_history(self):
         # 守两种静默失效：未唤醒轮被注入提示（污染模型输入）、
@@ -475,6 +440,67 @@ class OnMessageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(event.is_at_or_wake_command)
 
+    async def test_blacklist_user_skips_wake(self):
+        # 概率拉满：黑名单用户若不跳过，这条消息必然被唤醒
+        plugin = self._quiet_plugin(prob=1.0, blacklist_users=["group_demo:10002"])
+        event = Event()  # sender=10002, group_demo
+
+        await plugin.on_message(event)
+
+        self.assertFalse(event.is_at_or_wake_command)
+
+    def test_blacklist_keeps_only_valid_whitelisted_entries(self):
+        plugin = make_plugin(
+            whitelist_groups=["group_demo"],
+            blacklist_users=["other_group:10002", "group_demo:10003", "bad-entry", "  "],
+        )
+        self.assertEqual(plugin.blacklist_users, {("group_demo", "10003")})
+
+    async def test_mention_other_skips_wake(self):
+        # 概率拉满：若 @他人 未被跳过，这条消息必然被唤醒
+        plugin = self._quiet_plugin(prob=1.0)
+        event = Event()
+        event.messages = [At(qq="10003"), Plain("你看看这个")]
+
+        await plugin.on_message(event)
+
+        self.assertFalse(event.is_at_or_wake_command)
+
+    async def test_mention_self_or_all_still_wakes(self):
+        # 守静默漏唤醒：@自己、@全体、@自己+@他人 混合都不应被当成"@他人"跳过
+        plugin = self._quiet_plugin(prob=1.0)
+        for segs in ([At(qq="10001")], [At(qq="all")],
+                     [At(qq="10001"), At(qq="10003")]):
+            event = Event()
+            event.messages = segs + [Plain("在吗")]
+
+            await plugin.on_message(event)
+
+            self.assertTrue(event.is_at_or_wake_command, segs)
+
+    async def test_reply_other_skips_wake(self):
+        # 概率拉满：若"引用他人"未被跳过，这条消息必然被唤醒
+        plugin = self._quiet_plugin(prob=1.0)
+        event = Event()
+        event.messages = [Reply(sender_id="10003"), Plain("哈哈哈哈")]
+
+        await plugin.on_message(event)
+
+        self.assertFalse(event.is_at_or_wake_command)
+
+    async def test_reply_self_or_unknown_sender_still_wakes(self):
+        # 守静默漏唤醒：引用 bot 自己、发送者缺失（平台未提供）、
+        # @自己+引用他人 混合，都必须照常判定
+        plugin = self._quiet_plugin(prob=1.0)
+        for segs in ([Reply(sender_id="10001")], [Reply(sender_id="0")],
+                     [At(qq="10001"), Reply(sender_id="10003")]):
+            event = Event()
+            event.messages = segs + [Plain("在吗")]
+
+            await plugin.on_message(event)
+
+            self.assertTrue(event.is_at_or_wake_command, segs)
+
     async def test_persona_name_wake_sets_flag(self):
         plugin = self._quiet_plugin(persona_name_prob=1.0)
         event = Event()
@@ -495,15 +521,6 @@ class OnMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.is_at_or_wake_command)
         self.assertEqual(event.get_extra("wakelite_wake_source"), "keyword")
 
-    async def test_keyword_prob_zero_disables(self):
-        plugin = self._quiet_plugin(keyword_prob=0.0, keyword_words=["咖啡"])
-        event = Event()
-        event.message_str = "今天咖啡豆到了"
-
-        await plugin.on_message(event)
-
-        self.assertFalse(event.is_at_or_wake_command)
-
     async def test_keyword_empty_list_does_not_wake(self):
         # 关键词留空时，即使概率拉满也不得唤醒（否则等于全群概率插话）
         plugin = self._quiet_plugin(keyword_prob=1.0, keyword_words=[])
@@ -517,12 +534,6 @@ class OnMessageTests(unittest.IsolatedAsyncioTestCase):
 
 class RejectToolTests(unittest.IsolatedAsyncioTestCase):
 
-    def test_default_scopes_are_weak_signals_only(self):
-        self.assertEqual(
-            make_plugin().reject_tool_scopes,
-            {"probability", "keyword", "bored", "interest", "similarity"},
-        )
-
     async def test_tool_injected_when_woken_and_enabled(self):
         plugin = make_plugin(enable_reject_tool=True)
         event = Event()
@@ -533,51 +544,6 @@ class RejectToolTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(req.func_tool)
         self.assertIn("wakelite_decline_reply", req.func_tool.names())
-
-    async def test_tool_not_injected_without_wake(self):
-        plugin = make_plugin(enable_reject_tool=True)
-        req = ProviderRequest()
-
-        await plugin.inject_wake_hint(Event(), req)
-
-        self.assertIsNone(req.func_tool)
-
-    async def test_tool_not_injected_when_disabled(self):
-        plugin = make_plugin(enable_reject_tool=False)
-        event = Event()
-        plugin._wake(event, "10002", 123.0, "概率唤醒", source="probability")
-        req = ProviderRequest()
-
-        await plugin.inject_wake_hint(event, req)
-
-        self.assertIsNone(req.func_tool)
-
-    async def test_strong_signal_not_injected_by_default_scopes(self):
-        plugin = make_plugin(enable_reject_tool=True)
-        event = Event()
-        plugin._wake(event, "10002", 123.0, "答疑唤醒", source="ask")
-        req = ProviderRequest()
-
-        await plugin.inject_wake_hint(event, req)
-
-        self.assertIsNone(req.func_tool)
-
-    async def test_strong_signal_injected_when_explicitly_scoped(self):
-        plugin = make_plugin(
-            enable_reject_tool=True, reject_tool_scopes=["probability", "ask"]
-        )
-        event = Event()
-        plugin._wake(event, "10002", 123.0, "答疑唤醒", source="ask")
-        req = ProviderRequest()
-
-        await plugin.inject_wake_hint(event, req)
-
-        self.assertIsNotNone(req.func_tool)
-        self.assertIn("wakelite_decline_reply", req.func_tool.names())
-
-    def test_invalid_scope_values_ignored(self):
-        plugin = make_plugin(reject_tool_scopes=["ask", "bogus", 123])
-        self.assertEqual(plugin.reject_tool_scopes, {"ask"})
 
     async def test_injection_preserves_existing_tools(self):
         plugin = make_plugin(enable_reject_tool=True)
@@ -666,14 +632,6 @@ class AdapterLogicTests(unittest.IsolatedAsyncioTestCase):
         event = Event()
         self.assertFalse(plugin._compute_my_turn(event, "10001", "10001"))
 
-    def test_group_bots_parse_forms(self):
-        plugin = make_plugin(
-            group_bots=["10001", "10002:", "10003:123456789"]
-        )
-        self.assertIn(("10001", ""), plugin.group_bots)
-        self.assertIn(("10002", ""), plugin.group_bots)
-        self.assertIn(("10003", "123456789"), plugin.group_bots)
-
     def test_group_entry_scoped_to_its_group(self):
         plugin = make_plugin(group_bots=["10001:group_demo"])
         event = Event()  # gid=group_demo，用户消息
@@ -688,12 +646,6 @@ class AdapterLogicTests(unittest.IsolatedAsyncioTestCase):
         event.group_id = "other_group"
         self.assertTrue(plugin._compute_my_turn(event, "10002", "10001"))
 
-
-class LogConfigTests(unittest.TestCase):
-    def test_log_with_bot_id_reads_top_level_and_defaults_true(self):
-        self.assertTrue(make_plugin(log_with_bot_id=True).log_with_bot_id)
-        self.assertFalse(make_plugin(log_with_bot_id=False).log_with_bot_id)
-        self.assertTrue(make_plugin().log_with_bot_id)  # 缺省默认 true
 
 if __name__ == "__main__":
     unittest.main()

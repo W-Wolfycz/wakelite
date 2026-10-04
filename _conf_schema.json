@@ -11,6 +11,12 @@
     "default": [],
     "hint": "每行填一个群号。只有列表里的群才生效；留空 = 所有群都不处理。保存后立即生效。"
   },
+  "blacklist_users": {
+    "description": "群聊用户黑名单",
+    "type": "list",
+    "default": [],
+    "hint": "每行一条「群号:QQ」，该群内此用户的消息不参与唤醒；群号不在群聊白名单内的条目自动忽略。"
+  },
   "group_bots": {
     "description": "多 bot 分流（按群）",
     "type": "list",

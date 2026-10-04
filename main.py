@@ -10,7 +10,7 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.message import TextPart
-from astrbot.core.message.components import Plain
+from astrbot.core.message.components import At, Plain, Reply
 
 from .interest import Interest
 from .sentiment import sentiment
@@ -129,6 +129,27 @@ class WakeLitePlugin(Star):
         # 旧 log_config 组由 AstrBot 按新 schema 在加载前自动清理，插件不写迁移。
         self.log_with_bot_id = bool(config.get("log_with_bot_id", True))
 
+        # 群聊用户黑名单：每项 "群号:QQ"；群号不在白名单的条目静默忽略
+        self.blacklist_users: set[tuple[str, str]] = set()
+        blacklist_raw = config.get("blacklist_users", []) or []
+        if not isinstance(blacklist_raw, (list, tuple, set)):
+            blacklist_raw = []
+        for entry in blacklist_raw:
+            s = entry.strip() if isinstance(entry, str) else ""
+            if not s:
+                continue
+            gid_part, _, uid_part = s.partition(":")
+            gid_part, uid_part = gid_part.strip(), uid_part.strip()
+            if not (gid_part and uid_part):
+                logger.warning(
+                    f"{self._log_prefix()} blacklist_users 配置项格式错误"
+                    f"（应为 群号:QQ）：{s}"
+                )
+                continue
+            if gid_part not in self.whitelist_groups:
+                continue  # 群本身不生效，条目静默忽略
+            self.blacklist_users.add((gid_part, uid_part))
+
         # 多 bot 分流（按群）：每项 "self_id" 或 "self_id:group_id"；
         # 单段或冒号后为空 = 该 bot 在所有群参与分流。旧 bots 配置不再读取。
         group_bots_raw = config.get("group_bots", []) or []
@@ -176,6 +197,7 @@ class WakeLitePlugin(Star):
             f"无聊={self.bored_threshold}, 兴趣={self.interest_threshold}, "
             f"相关性={self.similar_threshold}, CD={self.wake_cd}s, "
             f"白名单群={len(self.whitelist_groups)}个, "
+            f"用户黑名单={len(self.blacklist_users)}条, "
             f"兴趣词包={len(self.interest_words)}个, "
             f"关键词唤醒={self.keyword_prob}({len(self.keyword_words)}词), "
             f"分群bot配置={len(self.group_bots)}条, "
@@ -380,6 +402,36 @@ class WakeLitePlugin(Star):
         return " ".join(plains).strip()
 
     @staticmethod
+    def _targets_only_others(event: AstrMessageEvent) -> bool:
+        """消息是否明确指向他人：@ 了他人或引用了他人，且没有任何指向自己的信号。
+
+        - @全体不特指某人，不计入；@自己 或 引用自己的消息 → 照常判定
+        - 被引用消息的发送者缺失（平台未提供，如 0/空）时无法判断 → 不排除，
+          避免把本该响应的消息漏掉
+        """
+        self_id = str(event.get_self_id())
+        points_to_self = False
+        points_to_other = False
+        for seg in event.get_messages():
+            if isinstance(seg, At):
+                qq = str(getattr(seg, "qq", ""))
+                if qq == "all":
+                    continue
+                if qq == self_id:
+                    points_to_self = True
+                else:
+                    points_to_other = True
+            elif isinstance(seg, Reply):
+                sender = str(getattr(seg, "sender_id", "") or "")
+                if not sender or sender == "0":
+                    continue  # 平台未提供被引用消息的发送者
+                if sender == self_id:
+                    points_to_self = True
+                else:
+                    points_to_other = True
+        return points_to_other and not points_to_self
+
+    @staticmethod
     def _normalize(text: str) -> str:
         """去掉标点、空白、大小写差异，用于复读比对。"""
         return re.sub(r"[^\w一-鿿]", "", text).lower()
@@ -574,6 +626,17 @@ class WakeLitePlugin(Star):
             return
 
         umo = event.unified_msg_origin
+
+        # 群内用户黑名单：该用户的消息不参与唤醒
+        if (str(gid), str(uid)) in self.blacklist_users:
+            self._log(f"用户在群内黑名单，跳过唤醒 umo={umo}", event=event)
+            return
+
+        # 明确指向他人（@他人 / 引用他人）的消息不参与唤醒判定
+        if self._targets_only_others(event):
+            self._log(f"消息指向他人，跳过唤醒 umo={umo}", event=event)
+            return
+
         plain = self._get_plain(event)
         if not plain:
             return
