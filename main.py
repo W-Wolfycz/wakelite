@@ -31,12 +31,12 @@ _WAKE_HINT_INTROS = {
 
 _REJECT_TOOL_NAME = "wakelite_decline_reply"
 _REJECT_TOOL_DESCRIPTION = (
-    "放弃本轮回复。当 WakeLite 的唤醒提示表明本轮你是被智能唤醒介入的，"
-    "而你判断这条消息实际上不需要你回复时调用本工具。典型场景：用户在明确询问"
-    "群里的另一个人、点名他人求助，或话题与当前人设无关且用户并不期望你插话。"
+    "放弃本轮回复。仅当消息明确是在问群里的另一个人、点名他人求助，"
+    "或话题与当前人设明显无关且用户显然不期望你插话时才调用。"
     "调用本工具前不要输出任何文字；调用后本轮不会向用户发送任何内容，"
     "请立即停止输出，不要再生成任何文字。"
-    "只有当你确实应该回答、或用户明显在对你提问时才不要调用。"
+    "reason 填一句简短原因，便于维护者排查。"
+    "拿不准是否需要回复时就正常回复，不要调用本工具。"
 )
 
 # 拒绝工具默认注入范围：仅弱信号唤醒（概率/关键词/无聊/兴趣/相关性）；
@@ -183,7 +183,18 @@ class WakeLitePlugin(Star):
         self._reject_tool = FunctionTool(
             name=_REJECT_TOOL_NAME,
             description=_REJECT_TOOL_DESCRIPTION,
-            parameters={"type": "object", "properties": {}},
+            parameters={
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": (
+                            "放弃本轮回复的简短原因，"
+                            "如：用户在询问群里的其他人 / 话题与人设无关。"
+                        ),
+                    }
+                },
+            },
             handler=self._decline_reply_handler,
         )
 
@@ -539,11 +550,18 @@ class WakeLitePlugin(Star):
 
     async def _decline_reply_handler(
         self, event: AstrMessageEvent, **kwargs
-    ) -> str:
-        """拒绝回复工具 handler：标记本轮事件，发送前由装饰 Hook 拦截清空。"""
+    ) -> None:
+        """拒绝回复工具 handler：标记本轮并结束，本轮不向用户发送任何内容。
+
+        返回 None 才会让框架结束本轮（返回字符串会作为工具结果回传模型，
+        tool loop 继续，弱模型会反复调用本工具）。返回前清空本轮已产生的
+        可见文本，否则工具执行器会把这段文字直接发送出去。
+        """
+        reason = str(kwargs.get("reason") or "").strip()
         event.set_extra("wakelite_declined", True)
+        event.clear_result()
         logger.info(f"{self._log_prefix(event)} LLM 已拒绝本轮唤醒回复")
-        return "已确认放弃本轮回复。"
+        self._log(f"拒绝原因 reason={reason or '未提供'}", event=event)
 
     @filter.on_llm_request()
     async def inject_wake_hint(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -558,8 +576,9 @@ class WakeLitePlugin(Star):
         reject_guide = ""
         if reject_allowed:
             reject_guide = (
-                "如果这条消息实际不需要你回复（例如用户在明确询问群里的另一个人、"
-                "点名他人求助），可以调用 wakelite_decline_reply 工具放弃本轮回复。"
+                "仅当这条消息明确不需要你回复（例如用户在明确询问群里的另一个人、"
+                "点名他人求助）时，才调用 wakelite_decline_reply 放弃本轮；"
+                "拿不准就正常回复。"
             )
         hint = (
             "<WAKELITE_WAKE_HINT>"

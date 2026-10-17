@@ -377,7 +377,8 @@ class CandidateWindowTests(unittest.IsolatedAsyncioTestCase):
         # 取消过期时间后，超过旧 TTL（10 分钟）的记录不再被硬丢弃，
         # 只受条数上限约束，旧记录靠时间衰减压低权重。
         self.assertEqual(len(sims), 10)
-        self.assertTrue(all(a is not None and a > 3600 for a in ages))
+        # 用 >=：年龄按「测试取时」与「实现取时」两次 clock 之差算，可能相等
+        self.assertTrue(all(a is not None and a >= 3600 for a in ages))
 
 class WakeHintTests(unittest.IsolatedAsyncioTestCase):
     async def test_hint_only_injected_on_wake_and_not_saved_to_history(self):
@@ -562,13 +563,20 @@ class RejectToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("wakelite_decline_reply", names)
 
     async def test_decline_handler_marks_event(self):
+        # 守静默失效：工具参数退化成空 schema（部分中转站报错）、
+        # handler 返回字符串让 tool loop 继续（模型反复调用本工具）、
+        # 调用前已产生的文本没被清掉（executor 会直接发送出去）
         plugin = make_plugin()
+        props = plugin._reject_tool.parameters.get("properties") or {}
+        self.assertIn("reason", props)
         event = Event()
+        event.set_result("模型调用工具前先说了话")
 
-        result = await plugin._decline_reply_handler(event)
+        result = await plugin._decline_reply_handler(event, reason="用户在问别人")
 
+        self.assertIsNone(result)
         self.assertTrue(event.get_extra("wakelite_declined", False))
-        self.assertIsInstance(result, str)
+        self.assertIsNone(event.get_result())
 
     async def test_block_clears_result_when_declined(self):
         plugin = make_plugin()
