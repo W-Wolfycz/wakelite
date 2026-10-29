@@ -53,9 +53,9 @@ _BOT_MSGS_MAX_CAP = 50
 # 拦掉反而更像故障，只对足够长的重复句生效
 _REREAD_MIN_LEN = 4
 
-# 跟随窗口的可选触发源：除了指令（管理命令，默认豁免），其余唤醒方式
-# 都会开启/刷新跟随窗口——「被唤醒了就进入玩手机状态」。
-_FOLLOW_UP_TRIGGER_OPTIONS = (
+# 跟随窗口黑名单的屏蔽范围：命中这些唤醒方式的发言者会被跳过。
+# window = 窗口内的概率兜底；其余对应各唤醒信号与核心唤醒。
+_FOLLOW_UP_BLOCK_SCOPES = (
     "at",
     "command",
     "persona_name",
@@ -65,16 +65,7 @@ _FOLLOW_UP_TRIGGER_OPTIONS = (
     "interest",
     "similarity",
     "probability",
-)
-_FOLLOW_UP_DEFAULT_TRIGGERS = (
-    "at",
-    "persona_name",
-    "keyword",
-    "ask",
-    "bored",
-    "interest",
-    "similarity",
-    "probability",
+    "window",
 )
 
 # 跟随窗口的概率曲线：时间因子与消息距离因子共用，均归一化到
@@ -93,6 +84,79 @@ def _follow_up_shape(curve: str, x: float) -> float:
     if curve == "smooth":
         return 1.0 - (3.0 * x * x - 2.0 * x * x * x)
     return 1.0 - x  # linear
+
+
+def _normalize_block_entries(raw) -> list[dict]:
+    """把黑名单配置归一化为 template_list 结构。
+
+    兼容两类来源：
+    - 新版 template_list：[{"id": ..., "scopes": [...]}]
+    - 旧版 ID 列表：["10003", ...]（迁移为「全部方式」，即完全忽略该发送者）
+    """
+    result: list[dict] = []
+    if not isinstance(raw, list):
+        return result
+    for item in raw:
+        if isinstance(item, dict):
+            sid = str(item.get("id", "")).strip()
+            if not sid:
+                continue
+            scopes = item.get("scopes")
+            if not isinstance(scopes, (list, tuple, set)):
+                scopes = list(_FOLLOW_UP_BLOCK_SCOPES)
+            valid = [
+                s
+                for s in scopes
+                if isinstance(s, str) and s in _FOLLOW_UP_BLOCK_SCOPES
+            ]
+            result.append(
+                {"id": sid, "scopes": valid or list(_FOLLOW_UP_BLOCK_SCOPES)}
+            )
+        elif isinstance(item, str) and item.strip():
+            result.append(
+                {"id": item.strip(), "scopes": list(_FOLLOW_UP_BLOCK_SCOPES)}
+            )
+    return result
+
+
+def _write_back_block_config(config, entries: list[dict]) -> None:
+    """把迁移后的黑名单写回配置（含持久化），失败只记日志不影响加载。"""
+    try:
+        config["follow_up_block_ids"] = entries
+        follow = config.get("follow_up")
+        if isinstance(follow, dict) and follow.get("block_ids"):
+            follow["block_ids"] = []
+        save = getattr(config, "save_config", None)
+        if callable(save):
+            save()
+    except Exception as e:
+        logger.warning(f"跟随黑名单迁移写回失败: {e}")
+
+
+def _migrate_block_config(config) -> list[dict]:
+    """读取并迁移跟随黑名单，返回归一化条目；必要时写回配置。
+
+    合并两个来源（按 ID 去重，顶层优先）：
+    - 顶层 `follow_up_block_ids`：新版 template，或更早的纯 ID 列表；
+    - `follow_up.block_ids`：1.3.7 的旧位置。
+    """
+    top_raw = config.get("follow_up_block_ids")
+    top = _normalize_block_entries(top_raw)
+    follow = config.get("follow_up")
+    group = (
+        _normalize_block_entries(follow.get("block_ids"))
+        if isinstance(follow, dict)
+        else []
+    )
+    seen = {e["id"] for e in top}
+    merged = top + [e for e in group if e["id"] not in seen]
+    top_is_template = isinstance(top_raw, list) and all(
+        isinstance(x, dict) for x in top_raw
+    )
+    if merged and (not top_is_template or group):
+        _write_back_block_config(config, merged)
+    return merged
+    return result
 
 
 def _clamp_float(value, default: float, minimum: float, maximum: float) -> float:
@@ -140,44 +204,29 @@ class WakeLitePlugin(Star):
         self.wake_cd = _clamp_float(config.get("wake_cd", 0.5), 0.5, 0.0, 10.0)
         # 唤醒跟随：被唤醒后该会话进入一个「玩手机」窗口。窗口内不再追踪某个
         # 用户，而是对每条消息独立算概率：时间因子 × 消息距离因子。
+        follow_cfg = config.get("follow_up", {})
+        if not isinstance(follow_cfg, dict):
+            follow_cfg = {}
         self.follow_up_window = _clamp_float(
-            config.get("follow_up_window", 0.0), 0.0, 0.0, 600.0
+            follow_cfg.get("window", 0.0), 0.0, 0.0, 600.0
         )
-        triggers_raw = config.get("follow_up_triggers", None)
-        if not isinstance(triggers_raw, (list, tuple, set)):
-            triggers_raw = _FOLLOW_UP_DEFAULT_TRIGGERS
-        self.follow_up_triggers: frozenset[str] = frozenset(
-            s for s in triggers_raw
-            if isinstance(s, str) and s in _FOLLOW_UP_TRIGGER_OPTIONS
-        )
+        # 指令是管理命令，默认不进入/刷新窗口（唯一豁免项）
+        self.follow_up_command = bool(follow_cfg.get("command", False))
         self.follow_up_prob = _clamp_float(
-            config.get("follow_up_prob", 1.0), 1.0, 0.0, 1.0
+            follow_cfg.get("prob", 1.0), 1.0, 0.0, 1.0
         )
-        curve = str(config.get("follow_up_curve", "linear") or "linear").strip().lower()
+        curve = str(follow_cfg.get("curve", "linear") or "linear").strip().lower()
         self.follow_up_curve = curve if curve in _FOLLOW_UP_CURVES else "linear"
         # 消息距离因子：自己上一条回复之后隔了多少条，越远概率越低；0 = 关闭
-        self.follow_up_gap = min(
-            50, _nonnegative_int(config.get("follow_up_gap", 0), 0)
-        )
+        self.follow_up_gap = _nonnegative_int(follow_cfg.get("gap", 0), 0)
         # 窗口内是否也响应「@他人 / 引用他人」的消息（默认不响应）
-        self.follow_up_allow_other_at = bool(
-            config.get("follow_up_allow_other_at", False)
-        )
-        # 跟随窗口黑名单：这些发送者（常用于排除群里其他机器人）不开窗，
-        # 窗口内也不参与概率响应；普通唤醒规则不受影响。
-        block_raw = config.get("follow_up_block_ids", []) or []
-        if not isinstance(block_raw, (list, tuple, set)):
-            block_raw = []
-        self.follow_up_block_ids: frozenset[str] = frozenset(
-            s.strip() for s in block_raw if isinstance(s, str) and s.strip()
-        )
-        # 回复新鲜度：该消息之后会话里又来了超过 N 条消息，就不再回复
-        # （模拟人的习惯：话题已经翻篇，懒得追旧消息；0 = 关闭）。
-        self.max_pending_msgs = min(
-            50,
-            _nonnegative_int(config.get("max_pending_msgs", 0), 0),
-        )
-        # 会话消息流计数：每收到一条消息 +1，用于新鲜度与距离因子
+        self.follow_up_allow_other_at = bool(follow_cfg.get("allow_other_at", False))
+        # 跟随黑名单：顶部新键优先；旧版列表/旧位置在这里自动迁移并写回
+        self.follow_up_block_ids: dict[str, frozenset[str]] = {
+            item["id"]: frozenset(item["scopes"])
+            for item in _migrate_block_config(config)
+        }
+        # 会话消息流计数：每收到一条消息 +1，供窗口距离因子使用
         self._session_msg_seq: dict[str, int] = {}
         self._session_seq_seen: dict[str, float] = {}
         # 跟随窗口：umo -> 窗口起点；umo -> 自己上一条回复时的会话序号
@@ -299,11 +348,10 @@ class WakeLitePlugin(Star):
             f"无聊={self.bored_threshold}, 兴趣={self.interest_threshold}, "
             f"相关性={self.similar_threshold}, CD={self.wake_cd}s, "
             f"跟随窗口={self.follow_up_window}s"
-            f"(触发={','.join(sorted(self.follow_up_triggers)) or '-'}"
+            f"(指令={'开' if self.follow_up_command else '豁免'}"
             f",起点={self.follow_up_prob},{self.follow_up_curve}"
             f",距离上限={self.follow_up_gap}条"
             f",屏蔽ID={len(self.follow_up_block_ids)}), "
-            f"新鲜度={self.max_pending_msgs}条, "
             f"白名单群={len(self.whitelist_groups)}个, "
             f"用户黑名单={len(self.blacklist_users)}条, "
             f"兴趣词包={len(self.interest_words)}个, "
@@ -620,6 +668,11 @@ class WakeLitePlugin(Star):
                 return True
         return False
 
+    def _is_blocked(self, uid: str, scope: str) -> bool:
+        """该发送者在此唤醒方式下是否被跟随黑名单屏蔽。"""
+        scopes = self.follow_up_block_ids.get(uid)
+        return bool(scopes) and scope in scopes
+
     def _wake(
         self,
         event: AstrMessageEvent,
@@ -628,6 +681,10 @@ class WakeLitePlugin(Star):
         reason: str,
         source: str | None = None,
     ) -> None:
+        # 黑名单按唤醒方式屏蔽：命中被屏蔽的方式时直接不唤醒
+        if source is not None and self._is_blocked(uid, source):
+            self._log(f"黑名单触发方式拦截 uid={uid} source={source}", event=event)
+            return
         event.is_at_or_wake_command = True
         # on_llm_request 才能拿到 ProviderRequest；先把来源存入事件 extras。
         event.set_extra(
@@ -635,12 +692,8 @@ class WakeLitePlugin(Star):
             source if source in _WAKE_HINT_INTROS else None,
         )
         self._last_wake[(event.unified_msg_origin, uid)] = now
-        if (
-            self.follow_up_window > 0
-            and source in self.follow_up_triggers
-            and uid not in self.follow_up_block_ids
-        ):
-            # 开启（或刷新）会话级跟随窗口：窗口属于会话，不追某个用户
+        # 任何唤醒信号都会开启/刷新会话级跟随窗口；概率兜底（affinity）不刷新。
+        if self.follow_up_window > 0 and source in _WAKE_HINT_INTROS:
             self._follow_up_start[event.unified_msg_origin] = now
         logger.info(f"{self._log_prefix(event)} {reason}")
 
@@ -784,19 +837,6 @@ class WakeLitePlugin(Star):
     @filter.on_llm_request()
     async def inject_wake_hint(self, event: AstrMessageEvent, req: ProviderRequest):
         """为智能唤醒追加临时提示，避免模型机械续写历史角色或口吻。"""
-        # 消息新鲜度：这条消息之后会话里又来了太多条，放弃本轮（不再调用 LLM）
-        if self.max_pending_msgs > 0:
-            seq = event.get_extra("wakelite_msg_seq", None)
-            if seq is not None:
-                umo = event.unified_msg_origin
-                lag = self._session_msg_seq.get(umo, 0) - seq
-                if lag > self.max_pending_msgs:
-                    self._log(
-                        f"消息已过时，放弃回复 umo={umo} lag={lag}",
-                        event=event,
-                    )
-                    event.stop_event()
-                    return
         source = event.get_extra("wakelite_wake_source", None)
         intro = _WAKE_HINT_INTROS.get(source)
         if not intro:
@@ -881,11 +921,10 @@ class WakeLitePlugin(Star):
 
         umo = event.unified_msg_origin
 
-        # 消息流计数：每条消息 +1，供新鲜度与窗口距离因子使用
+        # 会话消息流计数：每条消息 +1，供窗口的消息距离因子使用
         seq = self._session_msg_seq.get(umo, 0) + 1
         self._session_msg_seq[umo] = seq
         self._session_seq_seen[umo] = time.time()
-        event.set_extra("wakelite_msg_seq", seq)
 
         now = time.time()
         self._maintain_runtime_state(now)
@@ -902,13 +941,17 @@ class WakeLitePlugin(Star):
             self._log(f"用户在群内黑名单，跳过唤醒 umo={umo}", event=event)
             return
 
-        # 核心已唤醒（@ / 指令 / 引用 Bot）：@ 与指令分开配置，未勾选的来源
-        # 不开启窗口（指令默认不算唤醒）；黑名单发送者一律不开窗。
+        # 核心已唤醒（@ / 指令 / 引用 Bot）：@ 无条件开窗；指令默认豁免，
+        # 仅当 follow_up.command 开启时才开窗；黑名单按方式屏蔽。
         if event.is_at_or_wake_command:
-            if self.follow_up_window > 0 and uid not in self.follow_up_block_ids:
-                if "at" in self.follow_up_triggers and self._is_at_self(event):
+            if self.follow_up_window > 0:
+                if self._is_at_self(event) and not self._is_blocked(uid, "at"):
                     self._follow_up_start[umo] = now
-                elif "command" in self.follow_up_triggers and self._is_command(event):
+                elif (
+                    self.follow_up_command
+                    and self._is_command(event)
+                    and not self._is_blocked(uid, "command")
+                ):
                     self._follow_up_start[umo] = now
             return
 
@@ -916,8 +959,8 @@ class WakeLitePlugin(Star):
         if not plain:
             return
 
-        # 跟随窗口内：黑名单发送者不参与（其余消息照常跑信号与概率兜底）
-        if in_window and uid in self.follow_up_block_ids:
+        # 跟随窗口内：黑名单按「window」屏蔽的消息不参与（信号照常参与）
+        if in_window and self._is_blocked(uid, "window"):
             self._log(f"跟随窗口内黑名单发送者，跳过 umo={umo}", event=event)
             return
 
@@ -1037,7 +1080,7 @@ class WakeLitePlugin(Star):
                 return
 
         # 窗口内信号全部未命中：按「时间 × 消息距离」概率兜底
-        if in_window:
+        if in_window and not self._is_blocked(uid, "window"):
             prob = self._follow_up_hit_prob(umo, seq, now)
             if prob > 0 and random.random() < prob:
                 self._wake(

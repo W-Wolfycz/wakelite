@@ -131,6 +131,7 @@ _install_astrbot_stubs()
 
 from astrbot.api import FunctionTool, ToolSet
 from astrbot.core.message.components import At, Plain, Reply
+from wakelite import main as plugin_main
 from wakelite.main import WakeLitePlugin
 from wakelite.sentiment import sentiment
 from wakelite.similarity import Similarity
@@ -335,6 +336,14 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def _plugin(**overrides):
+        follow = {}
+        for key in list(overrides):
+            if key.startswith("follow_up_") and key != "follow_up_block_ids":
+                follow[key[len("follow_up_"):]] = overrides.pop(key)
+        if follow:
+            merged = dict(overrides.get("follow_up") or {})
+            merged.update(follow)
+            overrides["follow_up"] = merged
         defaults = dict(
             prob=0,
             persona_name_prob=0,
@@ -343,7 +352,7 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
             interest_threshold=1,
             similar_threshold=1,
             wake_cd=0,
-            follow_up_window=120,
+            follow_up={"window": 120},
         )
         defaults.update(overrides)
         return make_plugin(**defaults)
@@ -453,7 +462,9 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
     async def test_window_block_ids_not_in_probability(self):
         # ??????????????????????
         plugin = self._plugin(
-            follow_up_window=120, follow_up_prob=1.0, follow_up_block_ids=["10003"]
+            follow_up_window=120,
+            follow_up_prob=1.0,
+            follow_up_block_ids=[{"id": "10003", "scopes": ["window"]}],
         )
         plugin._follow_up_start[self.UMO] = time.time()
         event = Event()
@@ -516,7 +527,7 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_command_opens_when_selected(self):
         # 守静默失效：勾了 command 却不开窗
-        plugin = self._plugin(follow_up_window=120, follow_up_triggers=["command"])
+        plugin = self._plugin(follow_up_window=120, follow_up_command=True)
         event = Event()
         event.is_at_or_wake_command = True
         event.message_obj.message_str = "/help"
@@ -525,40 +536,98 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn(self.UMO, plugin._follow_up_start)
 
-class FreshnessTests(unittest.IsolatedAsyncioTestCase):
-    """回复新鲜度：消息之后涌入太多条就放弃本轮。"""
+    async def test_block_scope_keyword(self):
+        # 守静默失效：按方式屏蔽失效 → 被屏蔽关键词仍唤醒
+        plugin = self._plugin(
+            follow_up_window=120,
+            keyword_prob=1.0,
+            keyword_words=["咖啡"],
+            follow_up_block_ids=[{"id": "10003", "scopes": ["keyword"]}],
+        )
+        event = Event()
+        event.sender_id = "10003"
+        event.message_str = "今天咖啡豆到了"
 
-    @staticmethod
-    async def _feed(plugin, count):
-        for i in range(count):
-            event = Event()
-            event.sender_id = f"2000{i}"
+        with patch("wakelite.main.random.random", return_value=0.0):
             await plugin.on_message(event)
+        self.assertFalse(event.is_at_or_wake_command)  # keyword 被屏蔽
 
-    async def test_stale_message_stops_before_llm(self):
-        # 守静默失效：话题已翻篇仍回复（旧消息被追着回）
-        plugin = make_plugin(prob=0, persona_name_prob=0, max_pending_msgs=2)
-        first = Event()
-        await plugin.on_message(first)
-        await self._feed(plugin, 3)  # 之后又来了 3 条
+        # 同一 ID 的 @ 不受 keyword 屏蔽影响（核心唤醒照常开窗）
+        at_event = Event()
+        at_event.sender_id = "10003"
+        at_event.is_at_or_wake_command = True
+        at_event.messages = [At(qq="10001")]
+        await plugin.on_message(at_event)
+        self.assertIn(self.UMO, plugin._follow_up_start)
 
-        req = ProviderRequest()
-        await plugin.inject_wake_hint(first, req)
+    async def test_block_empty_scopes_means_all_groups(self):
+        # 守静默失效：只填 ID（触发方式留空）没有全群拉黑
+        plugin = self._plugin(
+            follow_up_window=120,
+            keyword_prob=1.0,
+            keyword_words=["咖啡"],
+            follow_up_block_ids=[{"id": "10003", "scopes": []}],
+        )
+        event = Event()
+        event.sender_id = "10003"
+        event.message_str = "今天咖啡豆到了"
 
-        self.assertTrue(first.is_stopped())
+        with patch("wakelite.main.random.random", return_value=0.0):
+            await plugin.on_message(event)
+        self.assertFalse(event.is_at_or_wake_command)  # 关键词被全方式屏蔽
 
-    async def test_pending_at_limit_is_allowed(self):
-        # 守边界：恰好等于上限应当允许（差一才放弃）
-        plugin = make_plugin(prob=0, persona_name_prob=0, max_pending_msgs=2)
-        first = Event()
-        await plugin.on_message(first)
-        await self._feed(plugin, 2)  # lag=2，等于上限
+        plugin._follow_up_start[self.UMO] = time.time()
+        event2 = Event()
+        event2.sender_id = "10003"
+        with patch("wakelite.main.random.random", return_value=0.0):
+            await plugin.on_message(event2)
+        self.assertFalse(event2.is_at_or_wake_command)  # 窗口兜底同样被屏蔽
 
-        req = ProviderRequest()
-        await plugin.inject_wake_hint(first, req)
+class BlockMigrationTests(unittest.TestCase):
+    """跟随黑名单迁移：旧 ID 列表 / 旧位置都要无损转换。"""
 
-        self.assertFalse(first.is_stopped())
+    def test_legacy_list_normalizes_to_template(self):
+        # 守静默失效：旧版 ID 列表迁移后丢失或方式为空
+        entries = plugin_main._normalize_block_entries(["10003", " 10004 ", ""])
+        self.assertEqual([e["id"] for e in entries], ["10003", "10004"])
+        self.assertEqual(entries[0]["scopes"], list(plugin_main._FOLLOW_UP_BLOCK_SCOPES))
 
+    def test_migrate_writeback_from_legacy_list(self):
+        # 守静默失效：旧列表没写回新键（重启后又变回旧格式）
+        config = {"follow_up_block_ids": ["10003"]}
+        entries = plugin_main._migrate_block_config(config)
+        self.assertEqual(entries[0]["id"], "10003")
+        self.assertIsInstance(config["follow_up_block_ids"][0], dict)
+
+    def test_migrate_from_group_position(self):
+        # 守静默失效：1.3.7 位置的黑名单丢失
+        config = {
+            "follow_up": {
+                "block_ids": [{"id": "10003", "scopes": ["window"]}]
+            }
+        }
+        entries = plugin_main._migrate_block_config(config)
+        self.assertEqual(entries[0]["id"], "10003")
+        self.assertEqual(config["follow_up_block_ids"][0]["scopes"], ["window"])
+        self.assertEqual(config["follow_up"]["block_ids"], [])
+
+    def test_migrate_merges_both_sources(self):
+        # 守静默失效：只迁移一处，另一处黑名单丢失
+        config = {
+            "follow_up_block_ids": ["10003"],
+            "follow_up": {"block_ids": [{"id": "10004", "scopes": ["window"]}]},
+        }
+        entries = plugin_main._migrate_block_config(config)
+        self.assertEqual([e["id"] for e in entries], ["10003", "10004"])
+        self.assertEqual(len(config["follow_up_block_ids"]), 2)
+
+    def test_new_template_is_kept(self):
+        config = {
+            "follow_up_block_ids": [{"id": "10003", "scopes": ["keyword"]}]
+        }
+        entries = plugin_main._migrate_block_config(config)
+        self.assertEqual(entries[0]["scopes"], ["keyword"])
+        self.assertIsInstance(config["follow_up_block_ids"][0], dict)
 
 class SimilarityTimeDecayTests(unittest.TestCase):
     MSG = "咖啡怎么手冲"

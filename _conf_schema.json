@@ -1,4 +1,30 @@
 {
+  "follow_up_block_ids": {
+    "description": "跟随黑名单",
+    "type": "template_list",
+    "default": [],
+    "hint": "按 ID 配置屏蔽范围：命中所选唤醒方式时该发送者不唤醒、不开窗。旧版本的 ID 列表会自动迁移成「全部方式」。",
+    "templates": {
+      "entry": {
+        "name": "黑名单条目",
+        "items": {
+          "id": {
+            "description": "发送者 ID",
+            "type": "string",
+            "default": ""
+          },
+          "scopes": {
+            "description": "屏蔽的触发方式",
+            "type": "list",
+            "options": ["at", "command", "persona_name", "keyword", "ask", "bored", "interest", "similarity", "probability", "window"],
+            "labels": ["@/引用 Bot", "指令唤醒", "人格名", "关键词", "答疑", "无聊", "兴趣", "相关性", "概率", "窗口兜底"],
+            "default": [],
+            "hint": "该 ID 在这些触发方式下被跳过；留空 = 全部方式（所有群聊都拉黑该 ID）。"
+          }
+        }
+      }
+    }
+  },
   "log_with_bot_id": {
     "description": "日志区分机器人实例",
     "type": "bool",
@@ -142,67 +168,86 @@
     "default": 0.5,
     "hint": "同一用户在同一会话中两次唤醒的最小间隔（秒）；0=关闭。"
   },
-  "follow_up_window": {
-    "description": "唤醒跟随窗口（秒）",
-    "type": "float",
-    "slider": {
-      "min": 0,
-      "max": 600,
-      "step": 5
-    },
-    "default": 0,
-    "hint": "按下方勾选的方式唤醒后，该会话进入跟随窗口：窗口内唤醒信号照常参与判定，信号未命中时按「时间 × 消息距离」概率兜底；0=关闭。"
-  },
-  "follow_up_triggers": {
-    "description": "进入跟随窗口的唤醒方式",
-    "type": "list",
-    "options": ["at", "command", "persona_name", "keyword", "ask", "bored", "interest", "similarity", "probability"],
-    "labels": ["@/引用 Bot", "指令唤醒", "人格名", "关键词", "答疑", "无聊", "兴趣", "相关性", "概率"],
-    "default": ["at", "persona_name", "keyword", "ask", "bored", "interest", "similarity", "probability"],
-    "hint": "任何唤醒都会开启/刷新窗口（默认全选）；指令是管理命令，默认豁免，需要单独勾选才会开窗。"
-  },
-  "follow_up_prob": {
-    "description": "跟随窗口起点概率",
-    "type": "float",
-    "slider": {
-      "min": 0,
-      "max": 1,
-      "step": 0.05
-    },
-    "default": 1.0,
-    "hint": "窗口刚开启时的回复概率；之后按曲线衰减。曲线选 constant 时窗口内概率恒为此值。"
-  },
-  "follow_up_curve": {
-    "description": "跟随概率曲线",
-    "type": "string",
-    "options": ["constant", "linear", "exponential", "smooth"],
-    "labels": ["不变", "线性", "指数", "平滑（S 型）"],
-    "default": "linear",
-    "hint": "时间因子与消息距离因子共用的衰减形状：不变=整窗恒定；线性=匀速下降；指数=先快后慢；平滑=两端平缓、中段最陡。"
-  },
-  "follow_up_gap": {
-    "description": "消息距离上限（条）",
-    "type": "int",
-    "default": 0,
-    "hint": "自己上一条回复之后隔了多少条消息，越远回复概率越低；达到该条数时概率归零。0=不启用距离因子，最大 50。"
-  },
-  "follow_up_allow_other_at": {
-    "description": "窗口内响应 @他人 的消息",
-    "type": "bool",
-    "default": false,
-    "hint": "开启后，窗口内「@他人/引用他人」的消息也参与概率判定；默认不响应（明显不是在跟本 Bot 说话）。"
-  },
-  "follow_up_block_ids": {
-    "description": "跟随窗口黑名单（ID）",
-    "type": "list",
-    "default": [],
-    "hint": "每行一个发送者 ID；这些 ID 不会开启跟随窗口，窗口内也不参与概率响应（用于排除群里的其他机器人）。普通唤醒规则不受影响。"
-  },
-  "max_pending_msgs": {
-    "description": "回复新鲜度上限（条）",
-    "type": "int",
-    "default": 0,
-    "hint": "该消息之后会话里又来了超过 N 条消息时放弃本轮回复（模拟人不再追旧话题；0=关闭，最大 50）。"
+  "follow_up": {
+    "description": "唤醒跟随窗口",
+    "type": "object",
+    "items": {
+      "window": {
+        "description": "窗口长度（秒）",
+        "type": "float",
+        "slider": {
+          "min": 0,
+          "max": 600,
+          "step": 5
+        },
+        "default": 0,
+        "hint": "被唤醒后该会话进入跟随窗口：窗口内信号照常参与，信号未命中时按「时间 × 消息距离」概率兜底；0=关闭。"
+      },
+      "command": {
+        "description": "指令也进入窗口",
+        "type": "bool",
+        "default": false,
+        "hint": "勾选后指令前缀的消息也会开启/刷新窗口；默认豁免（管理命令不进入跟随状态）。"
+      },
+      "prob": {
+        "description": "窗口起点概率",
+        "type": "float",
+        "slider": {
+          "min": 0,
+          "max": 1,
+          "step": 0.05
+        },
+        "default": 1.0,
+        "hint": "窗口刚开启时的回复概率；之后按曲线衰减。曲线选 constant 时窗口内概率恒为此值。"
+      },
+      "curve": {
+        "description": "跟随概率曲线",
+        "type": "string",
+        "options": ["constant", "linear", "exponential", "smooth"],
+        "labels": ["不变", "线性", "指数", "平滑（S 型）"],
+        "default": "linear",
+        "hint": "时间因子与消息距离因子共用的衰减形状：不变=恒定；线性=匀速下降；指数=先快后慢；平滑=两端平缓、中段最陡。"
+      },
+      "gap": {
+        "description": "消息距离上限（条）",
+        "type": "int",
+        "default": 0,
+        "hint": "自己上一条回复之后隔了多少条消息，越远回复概率越低；达到该条数时概率归零。0=不启用距离因子。"
+      },
+      "allow_other_at": {
+        "description": "窗口内响应 @他人 的消息",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，窗口内「@他人/引用他人」的消息也参与判定；默认不响应（明显不是在跟本 Bot 说话）。"
+      },
+      "block_ids": {
+        "description": "跟随黑名单（旧位置，自动迁移）",
+        "type": "template_list",
+        "default": [],
+        "invisible": true,
+        "hint": "旧版本位置；升级时自动迁移到顶部的跟随黑名单，可留空。",
+        "templates": {
+          "entry": {
+            "name": "黑名单条目",
+            "items": {
+              "id": {
+                "description": "发送者 ID",
+                "type": "string",
+                "default": ""
+              },
+              "scopes": {
+                "description": "屏蔽的触发方式",
+                "type": "list",
+                "options": ["at", "command", "persona_name", "keyword", "ask", "bored", "interest", "similarity", "probability", "window"],
+                "labels": ["@/引用 Bot", "指令唤醒", "人格名", "关键词", "答疑", "无聊", "兴趣", "相关性", "概率", "窗口兜底"],
+                "default": [],
+                "hint": "该 ID 在这些触发方式下被跳过；留空 = 全部方式（所有群聊都拉黑该 ID）。"
+              }
+            }
+          }
+        }
+      }
+    }
   },
   "enable_reject_tool": {
     "description": "唤醒后允许 LLM 主动拒绝回复",
