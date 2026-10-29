@@ -336,14 +336,20 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def _plugin(**overrides):
-        follow = {}
+        base = {"enabled": True, "window": 120}
+        flat = {}
         for key in list(overrides):
             if key.startswith("follow_up_") and key != "follow_up_block_ids":
-                follow[key[len("follow_up_"):]] = overrides.pop(key)
-        if follow:
-            merged = dict(overrides.get("follow_up") or {})
-            merged.update(follow)
-            overrides["follow_up"] = merged
+                flat[key[len("follow_up_"):]] = overrides.pop(key)
+        explicit = overrides.get("follow_up")
+        if isinstance(explicit, dict):
+            merged = {**base, **explicit}
+        else:
+            merged = dict(base)
+        merged.update(flat)
+        if merged.get("window", 0) > 0 and "enabled" not in merged:
+            merged["enabled"] = True
+        overrides["follow_up"] = merged
         defaults = dict(
             prob=0,
             persona_name_prob=0,
@@ -352,7 +358,6 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
             interest_threshold=1,
             similar_threshold=1,
             wake_cd=0,
-            follow_up={"window": 120},
         )
         defaults.update(overrides)
         return make_plugin(**defaults)
@@ -374,6 +379,16 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(
             constant._follow_up_hit_prob(self.UMO, 1, 1099.0), 0.5
         )
+
+    def test_power_curve_shape(self):
+        # 守静默失效：power 曲线写成线性或方向反了（先慢后快变先快后慢）
+        plugin = self._plugin(
+            follow_up_window=100, follow_up_prob=1.0, follow_up_curve="power"
+        )
+        plugin._follow_up_start[self.UMO] = 1000.0
+        self.assertAlmostEqual(plugin._follow_up_hit_prob(self.UMO, 1, 1000.0), 1.0)
+        self.assertAlmostEqual(plugin._follow_up_hit_prob(self.UMO, 1, 1050.0), 0.75)
+        self.assertAlmostEqual(plugin._follow_up_hit_prob(self.UMO, 1, 1100.0), 0.0)
 
     def test_prob_gap_factor(self):
         # ???????????? ? ????????????
@@ -416,7 +431,7 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
         with patch("wakelite.main.random.random", return_value=0.0):
             await plugin.on_message(event2)
         self.assertTrue(event2.is_at_or_wake_command)
-        self.assertIsNone(event2.get_extra("wakelite_wake_source"))  # 兜底不注入提示
+        self.assertEqual(event2.get_extra("wakelite_wake_source"), "window")
 
         # 3) 概率未命中 → 不唤醒
         event3 = Event()
@@ -459,12 +474,12 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
             await allowed.on_message(event2)
         self.assertTrue(event2.is_at_or_wake_command)  # ???????
 
-    async def test_window_block_ids_not_in_probability(self):
-        # ??????????????????????
+    async def test_blacklist_window_source(self):
+        # 守静默失效：窗口兜底命中不受唤醒源黑名单约束
         plugin = self._plugin(
             follow_up_window=120,
             follow_up_prob=1.0,
-            follow_up_block_ids=[{"id": "10003", "scopes": ["window"]}],
+            blacklist_users=[{"id": "10003", "sources": ["window"]}],
         )
         plugin._follow_up_start[self.UMO] = time.time()
         event = Event()
@@ -474,6 +489,50 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
             await plugin.on_message(event)
 
         self.assertFalse(event.is_at_or_wake_command)
+
+    async def test_window_ignores_bot_sharding(self):
+        # 守静默失效：窗口内仍被多 bot 分流拦住（该接话时无人接）
+        bots = ["10002:group_demo"]  # 本 bot 10001 不在池内
+        outside = self._plugin(prob=0, group_bots=bots)
+        event = Event()
+        with patch("wakelite.main.random.random", return_value=0.0):
+            await outside.on_message(event)
+        self.assertFalse(event.is_at_or_wake_command)  # 窗口外按分流轮空
+
+        inside = self._plugin(
+            prob=0,
+            group_bots=bots,
+            follow_up_window=120,
+            follow_up_prob=1.0,
+        )
+        inside._follow_up_start[self.UMO] = time.time()
+        event2 = Event()
+        with patch("wakelite.main.random.random", return_value=0.0):
+            await inside.on_message(event2)
+        self.assertTrue(event2.is_at_or_wake_command)  # 窗口内不受分流影响
+
+    async def test_follow_up_disabled_ignores_window(self):
+        # 守静默失效：关闭启用开关后窗口仍生效（配置总开关形同虚设）
+        plugin = self._plugin(follow_up={"enabled": False, "window": 120, "prob": 1.0})
+        plugin._follow_up_start[self.UMO] = time.time()
+        event = Event()
+        with patch("wakelite.main.random.random", return_value=0.0):
+            await plugin.on_message(event)
+        self.assertFalse(event.is_at_or_wake_command)  # 窗口不生效
+        self.assertFalse(plugin._follow_up_active(time.time(), self.UMO))
+
+    async def test_window_hit_refreshes_start(self):
+        # 守静默失效：窗口兜底命中后没启动/刷新窗口（唤醒后应进入玩手机状态）
+        plugin = self._plugin(follow_up_prob=1.0)
+        old = time.time() - 60
+        plugin._follow_up_start[self.UMO] = old
+        event = Event()
+
+        with patch("wakelite.main.random.random", return_value=0.0):
+            await plugin.on_message(event)
+
+        self.assertTrue(event.is_at_or_wake_command)
+        self.assertGreater(plugin._follow_up_start[self.UMO], old)
 
     async def test_window_opens_on_trigger(self):
         # ???????????????????????????
@@ -501,6 +560,36 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
         await plugin.on_message(event)
 
         self.assertGreater(plugin._follow_up_start[self.UMO], old)
+
+    async def test_window_wake_can_be_rejected(self):
+        # 守静默失效：勾了窗口兜底却不注入拒绝工具（或未勾选也注入）
+        plugin = self._plugin(
+            follow_up_prob=1.0,
+            enable_reject_tool=True,
+            reject_tool_scopes=["window"],
+        )
+        plugin._follow_up_start[self.UMO] = time.time()
+        event = Event()
+        with patch("wakelite.main.random.random", return_value=0.0):
+            await plugin.on_message(event)
+        self.assertTrue(event.is_at_or_wake_command)
+
+        req = ProviderRequest()
+        await plugin.inject_wake_hint(event, req)
+        self.assertIsNotNone(req.func_tool)  # 窗口兜底可拒绝
+
+        plain = self._plugin(
+            follow_up_prob=1.0,
+            enable_reject_tool=True,
+            reject_tool_scopes=["keyword"],
+        )
+        plain._follow_up_start[self.UMO] = time.time()
+        event2 = Event()
+        with patch("wakelite.main.random.random", return_value=0.0):
+            await plain.on_message(event2)
+        req2 = ProviderRequest()
+        await plain.inject_wake_hint(event2, req2)
+        self.assertIsNone(req2.func_tool)  # 未勾选 window 时不注入
 
     async def test_anchor_recorded_on_result(self):
         # ???????????????? ? ????????
@@ -536,13 +625,13 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn(self.UMO, plugin._follow_up_start)
 
-    async def test_block_scope_keyword(self):
-        # 守静默失效：按方式屏蔽失效 → 被屏蔽关键词仍唤醒
+    async def test_blacklist_keyword_source(self):
+        # 守静默失效：按唤醒源屏蔽失效 → 被屏蔽的关键词仍唤醒
         plugin = self._plugin(
             follow_up_window=120,
             keyword_prob=1.0,
             keyword_words=["咖啡"],
-            follow_up_block_ids=[{"id": "10003", "scopes": ["keyword"]}],
+            blacklist_users=[{"id": "10003", "sources": ["keyword"]}],
         )
         event = Event()
         event.sender_id = "10003"
@@ -552,7 +641,7 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
             await plugin.on_message(event)
         self.assertFalse(event.is_at_or_wake_command)  # keyword 被屏蔽
 
-        # 同一 ID 的 @ 不受 keyword 屏蔽影响（核心唤醒照常开窗）
+        # 同一 ID 的 @ 不受黑名单影响（核心唤醒照常开窗）
         at_event = Event()
         at_event.sender_id = "10003"
         at_event.is_at_or_wake_command = True
@@ -560,13 +649,13 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
         await plugin.on_message(at_event)
         self.assertIn(self.UMO, plugin._follow_up_start)
 
-    async def test_block_empty_scopes_means_all_groups(self):
-        # 守静默失效：只填 ID（触发方式留空）没有全群拉黑
+    async def test_blacklist_empty_sources_means_all(self):
+        # 守静默失效：只填 ID（唤醒源留空）没有全部屏蔽
         plugin = self._plugin(
             follow_up_window=120,
             keyword_prob=1.0,
             keyword_words=["咖啡"],
-            follow_up_block_ids=[{"id": "10003", "scopes": []}],
+            blacklist_users=[{"id": "10003", "sources": []}],
         )
         event = Event()
         event.sender_id = "10003"
@@ -574,7 +663,7 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("wakelite.main.random.random", return_value=0.0):
             await plugin.on_message(event)
-        self.assertFalse(event.is_at_or_wake_command)  # 关键词被全方式屏蔽
+        self.assertFalse(event.is_at_or_wake_command)  # 关键词被屏蔽
 
         plugin._follow_up_start[self.UMO] = time.time()
         event2 = Event()
@@ -583,51 +672,82 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
             await plugin.on_message(event2)
         self.assertFalse(event2.is_at_or_wake_command)  # 窗口兜底同样被屏蔽
 
+
 class BlockMigrationTests(unittest.TestCase):
-    """跟随黑名单迁移：旧 ID 列表 / 旧位置都要无损转换。"""
+    """唤醒源黑名单迁移：旧「群号:QQ」列表 / 1.3.7 跟随黑名单都要无损转换。"""
 
     def test_legacy_list_normalizes_to_template(self):
-        # 守静默失效：旧版 ID 列表迁移后丢失或方式为空
-        entries = plugin_main._normalize_block_entries(["10003", " 10004 ", ""])
-        self.assertEqual([e["id"] for e in entries], ["10003", "10004"])
-        self.assertEqual(entries[0]["scopes"], list(plugin_main._FOLLOW_UP_BLOCK_SCOPES))
+        # 守静默失效：旧版「群号:QQ」列表迁移后丢失或唤醒源为空
+        entries = plugin_main._normalize_blacklist_entries(
+            ["group_demo:10003", "10004", ""]
+        )
+        self.assertEqual([e["id"] for e in entries], ["group_demo:10003", "10004"])
+        self.assertEqual(
+            entries[0]["sources"], list(plugin_main._WAKE_SOURCE_OPTIONS)
+        )
 
     def test_migrate_writeback_from_legacy_list(self):
         # 守静默失效：旧列表没写回新键（重启后又变回旧格式）
-        config = {"follow_up_block_ids": ["10003"]}
-        entries = plugin_main._migrate_block_config(config)
-        self.assertEqual(entries[0]["id"], "10003")
-        self.assertIsInstance(config["follow_up_block_ids"][0], dict)
+        config = {"blacklist_users": ["group_demo:10003"]}
+        entries = plugin_main._migrate_blacklist_config(config)
+        self.assertEqual(entries[0]["id"], "group_demo:10003")
+        self.assertIsInstance(config["blacklist_users"][0], dict)
 
-    def test_migrate_from_group_position(self):
-        # 守静默失效：1.3.7 位置的黑名单丢失
+    def test_migrate_flat_follow_up_config(self):
+        # 守静默失效：旧平铺配置没迁移到分组（窗口配置丢失/未启用）
         config = {
-            "follow_up": {
-                "block_ids": [{"id": "10003", "scopes": ["window"]}]
-            }
+            "follow_up": {"enabled": False, "window": 0.0},
+            "follow_up_window": 180,
+            "follow_up_prob": 0.4,
+            "follow_up_curve": "smooth",
         }
-        entries = plugin_main._migrate_block_config(config)
-        self.assertEqual(entries[0]["id"], "10003")
-        self.assertEqual(config["follow_up_block_ids"][0]["scopes"], ["window"])
-        self.assertEqual(config["follow_up"]["block_ids"], [])
+        plugin_main._migrate_follow_up_config(config)
+        group = config["follow_up"]
+        self.assertEqual(group["window"], 180)
+        self.assertEqual(group["prob"], 0.4)
+        self.assertEqual(group["curve"], "smooth")
+        self.assertTrue(group["enabled"])  # window>0 自动启用
+        self.assertEqual(config["follow_up_window"], 0.0)  # 平铺键清空
+
+        # 分组里已显式设置时不被平铺键覆盖
+        config2 = {
+            "follow_up": {"window": 60, "enabled": False},
+            "follow_up_window": 999,
+        }
+        plugin_main._migrate_follow_up_config(config2)
+        self.assertEqual(config2["follow_up"]["window"], 60)
+        self.assertFalse(config2["follow_up"]["enabled"])
+
+    def test_migrate_from_follow_up_positions(self):
+        # 守静默失效：1.3.7 跟随黑名单的条目丢失
+        config = {
+            "follow_up_block_ids": [{"id": "10003", "scopes": ["keyword", "at"]}],
+            "follow_up": {"block_ids": [{"id": "10004", "scopes": ["window"]}]},
+        }
+        entries = plugin_main._migrate_blacklist_config(config)
+        by_id = {e["id"]: e["sources"] for e in entries}
+        self.assertEqual(by_id["10003"], ["keyword"])  # at 不归黑名单管
+        self.assertEqual(by_id["10004"], ["window"])
+        self.assertEqual(config["follow_up_block_ids"], [])
 
     def test_migrate_merges_both_sources(self):
         # 守静默失效：只迁移一处，另一处黑名单丢失
         config = {
-            "follow_up_block_ids": ["10003"],
-            "follow_up": {"block_ids": [{"id": "10004", "scopes": ["window"]}]},
+            "blacklist_users": ["group_demo:10003"],
+            "follow_up_block_ids": [{"id": "10004", "scopes": ["keyword"]}],
         }
-        entries = plugin_main._migrate_block_config(config)
-        self.assertEqual([e["id"] for e in entries], ["10003", "10004"])
-        self.assertEqual(len(config["follow_up_block_ids"]), 2)
+        entries = plugin_main._migrate_blacklist_config(config)
+        self.assertEqual([e["id"] for e in entries], ["group_demo:10003", "10004"])
+        self.assertEqual(len(config["blacklist_users"]), 2)
 
     def test_new_template_is_kept(self):
         config = {
-            "follow_up_block_ids": [{"id": "10003", "scopes": ["keyword"]}]
+            "blacklist_users": [{"id": "10003", "sources": ["keyword"]}]
         }
-        entries = plugin_main._migrate_block_config(config)
-        self.assertEqual(entries[0]["scopes"], ["keyword"])
-        self.assertIsInstance(config["follow_up_block_ids"][0], dict)
+        entries = plugin_main._migrate_blacklist_config(config)
+        self.assertEqual(entries[0]["sources"], ["keyword"])
+        self.assertIsInstance(config["blacklist_users"][0], dict)
+
 
 class SimilarityTimeDecayTests(unittest.TestCase):
     MSG = "咖啡怎么手冲"
@@ -789,12 +909,18 @@ class OnMessageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(event.is_at_or_wake_command)
 
-    def test_blacklist_keeps_only_valid_whitelisted_entries(self):
+    def test_blacklist_entries_parsed(self):
+        # 守静默失效：黑名单条目解析失败（QQ / 群号:QQ）
         plugin = make_plugin(
-            whitelist_groups=["group_demo"],
-            blacklist_users=["other_group:10002", "group_demo:10003", "bad-entry", "  "],
+            blacklist_users=[
+                {"id": "10003", "sources": ["keyword"]},
+                {"id": "group_demo:10004", "sources": ["window"]},
+            ]
         )
-        self.assertEqual(plugin.blacklist_users, {("group_demo", "10003")})
+        self.assertEqual(plugin._wake_blacklist["10003"], frozenset({"keyword"}))
+        self.assertEqual(
+            plugin._wake_blacklist["group_demo:10004"], frozenset({"window"})
+        )
 
     async def test_mention_other_skips_wake(self):
         # 概率拉满：若 @他人 未被跳过，这条消息必然被唤醒
