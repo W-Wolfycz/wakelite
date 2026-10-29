@@ -5,6 +5,7 @@ import time
 import types
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 import jieba
 
@@ -168,10 +169,17 @@ class PersonaManager:
 class QueryRecorder:
     def __init__(self):
         self.args = None
+        self.calls = []
         self.records = []
+        # 按 user_filter 返回不同记录（None = 全量查询）
+        self.records_by_user = {}
 
     async def query_history(self, *args, **kwargs):
         self.args = (args, kwargs)
+        self.calls.append((args, kwargs))
+        user_filter = args[2] if len(args) > 2 else kwargs.get("user_filter")
+        if self.records_by_user:
+            return self.records_by_user.get(user_filter, [])
         return self.records
 
 
@@ -205,6 +213,7 @@ class Event:
         self._result = None
         self._force_stopped = False
         self.message_str = "用户消息"
+        self.message_obj = types.SimpleNamespace(message_str=self.message_str)
         self.messages = []
         self.group_id = "group_demo"
         self.sender_id = "10002"
@@ -284,6 +293,13 @@ class DomainTests(unittest.TestCase):
         plugin = make_plugin(interest_words=["咖啡 手冲", None, 123])
         self.assertEqual(plugin.interest_words, [["咖啡", "手冲"]])
 
+    def test_reread_ignores_short_messages(self):
+        # 守静默失效：短句被误判复读（「好的」「收到」）→ 常见应答应被吞掉
+        plugin = make_plugin()
+        self.assertFalse(plugin._is_reread("好的", ["好的"]))
+        self.assertFalse(plugin._is_reread("收到", ["收到"]))
+        self.assertTrue(plugin._is_reread("好的收到", ["好的收到"]))
+
     def test_numeric_config_is_clamped(self):
         plugin = make_plugin(
             prob=2,
@@ -312,6 +328,238 @@ class DomainTests(unittest.TestCase):
         )
 
 
+class FollowUpTests(unittest.IsolatedAsyncioTestCase):
+    """??????????????? x ??????"""
+
+    UMO = "platform_demo:GroupMessage:group_demo"
+
+    @staticmethod
+    def _plugin(**overrides):
+        defaults = dict(
+            prob=0,
+            persona_name_prob=0,
+            ask_threshold=1,
+            bored_threshold=1,
+            interest_threshold=1,
+            similar_threshold=1,
+            wake_cd=0,
+            follow_up_window=120,
+        )
+        defaults.update(overrides)
+        return make_plugin(**defaults)
+
+    def test_prob_time_curve_and_start(self):
+        # ???????????? ? ?????????????
+        plugin = self._plugin(
+            follow_up_window=100, follow_up_prob=1.0, follow_up_curve="linear"
+        )
+        plugin._follow_up_start[self.UMO] = 1000.0
+        self.assertAlmostEqual(plugin._follow_up_hit_prob(self.UMO, 1, 1000.0), 1.0)
+        self.assertAlmostEqual(plugin._follow_up_hit_prob(self.UMO, 1, 1050.0), 0.5)
+        self.assertAlmostEqual(plugin._follow_up_hit_prob(self.UMO, 1, 1100.0), 0.0)
+
+        constant = self._plugin(
+            follow_up_window=100, follow_up_prob=0.5, follow_up_curve="constant"
+        )
+        constant._follow_up_start[self.UMO] = 1000.0
+        self.assertAlmostEqual(
+            constant._follow_up_hit_prob(self.UMO, 1, 1099.0), 0.5
+        )
+
+    def test_prob_gap_factor(self):
+        # ???????????? ? ????????????
+        plugin = self._plugin(
+            follow_up_window=100,
+            follow_up_prob=1.0,
+            follow_up_curve="linear",
+            follow_up_gap=10,
+        )
+        plugin._follow_up_start[self.UMO] = 1000.0
+        plugin._last_bot_seq[self.UMO] = 5
+        self.assertAlmostEqual(plugin._follow_up_hit_prob(self.UMO, 5, 1000.0), 1.0)
+        self.assertAlmostEqual(plugin._follow_up_hit_prob(self.UMO, 10, 1000.0), 0.5)
+        self.assertAlmostEqual(plugin._follow_up_hit_prob(self.UMO, 15, 1000.0), 0.0)
+
+        plugin._last_bot_seq.pop(self.UMO)  # ????????
+        self.assertAlmostEqual(plugin._follow_up_hit_prob(self.UMO, 999, 1000.0), 1.0)
+
+    async def test_window_signals_and_probability_both_participate(self):
+        # 守静默失效：窗口内信号被跳过（明确叫它却不回）；或概率兜底不生效
+        plugin = self._plugin(
+            follow_up_window=120,
+            follow_up_prob=0.5,
+            keyword_prob=1.0,
+            keyword_words=["咖啡"],
+        )
+        plugin._follow_up_start[self.UMO] = time.time()
+
+        # 1) 窗口内关键词命中 → 直接唤醒（信号参与判定）
+        event = Event()
+        event.message_str = "今天咖啡豆到了"
+        with patch("wakelite.main.random.random", return_value=0.0):
+            await plugin.on_message(event)
+        self.assertTrue(event.is_at_or_wake_command)
+
+        # 2) 窗口内无信号命中，概率兜底命中 → 唤醒
+        plugin._follow_up_start[self.UMO] = time.time()  # 关键词唤醒已刷新起点
+        event2 = Event()
+        event2.message_str = "随便聊聊"
+        with patch("wakelite.main.random.random", return_value=0.0):
+            await plugin.on_message(event2)
+        self.assertTrue(event2.is_at_or_wake_command)
+        self.assertIsNone(event2.get_extra("wakelite_wake_source"))  # 兜底不注入提示
+
+        # 3) 概率未命中 → 不唤醒
+        event3 = Event()
+        event3.message_str = "随便聊聊"
+        with patch("wakelite.main.random.random", return_value=0.9):
+            await plugin.on_message(event3)
+        self.assertFalse(event3.is_at_or_wake_command)
+
+    async def test_window_expired_falls_back_to_signals(self):
+        # 守静默失效：窗口过期后仍按窗口概率；或旧窗口没被清理
+        plugin = self._plugin(follow_up_window=60, prob=1.0)
+        old = time.time() - 61
+        plugin._follow_up_start[self.UMO] = old
+        event = Event()
+
+        await plugin.on_message(event)
+
+        self.assertTrue(event.is_at_or_wake_command)  # 走普通概率信号
+        # 新语义：任何唤醒都会重新开窗，起点被刷新
+        self.assertGreater(plugin._follow_up_start[self.UMO], old)
+
+    async def test_window_other_at(self):
+        # ?????????? @?? ??????????????
+        plugin = self._plugin(follow_up_window=120, follow_up_prob=1.0)
+        event = Event()
+        event.messages = [At(qq="10009")]  # @??
+        plugin._follow_up_start[self.UMO] = time.time()
+
+        await plugin.on_message(event)
+
+        self.assertFalse(event.is_at_or_wake_command)  # ?????
+
+        allowed = self._plugin(
+            follow_up_window=120, follow_up_prob=1.0, follow_up_allow_other_at=True
+        )
+        allowed._follow_up_start[self.UMO] = time.time()
+        event2 = Event()
+        event2.messages = [At(qq="10009")]
+        with patch("wakelite.main.random.random", return_value=0.0):
+            await allowed.on_message(event2)
+        self.assertTrue(event2.is_at_or_wake_command)  # ???????
+
+    async def test_window_block_ids_not_in_probability(self):
+        # ??????????????????????
+        plugin = self._plugin(
+            follow_up_window=120, follow_up_prob=1.0, follow_up_block_ids=["10003"]
+        )
+        plugin._follow_up_start[self.UMO] = time.time()
+        event = Event()
+        event.sender_id = "10003"
+
+        with patch("wakelite.main.random.random", return_value=0.0):
+            await plugin.on_message(event)
+
+        self.assertFalse(event.is_at_or_wake_command)
+
+    async def test_window_opens_on_trigger(self):
+        # ???????????????????????????
+        plugin = self._plugin(
+            follow_up_window=120, keyword_prob=1.0, keyword_words=["??"]
+        )
+        event = Event()
+        event.message_str = "???????"
+
+        with patch("wakelite.main.random.random", return_value=0.0):
+            await plugin.on_message(event)
+
+        self.assertTrue(event.is_at_or_wake_command)
+        self.assertIn(self.UMO, plugin._follow_up_start)  # keyword ??? triggers ?
+
+    async def test_window_at_self_refreshes_start(self):
+        # ????????? @ ???????
+        plugin = self._plugin(follow_up_window=120)
+        event = Event()
+        event.is_at_or_wake_command = True
+        event.messages = [At(qq="10001")]
+        old = time.time() - 60
+        plugin._follow_up_start[self.UMO] = old
+
+        await plugin.on_message(event)
+
+        self.assertGreater(plugin._follow_up_start[self.UMO], old)
+
+    async def test_anchor_recorded_on_result(self):
+        # ???????????????? ? ????????
+        plugin = self._plugin(follow_up_window=120)
+        event = Event()
+        event._result = object()
+        plugin._session_msg_seq[self.UMO] = 7
+
+        await plugin.block_declined_reply(event)
+
+        self.assertEqual(plugin._last_bot_seq.get(self.UMO), 7)
+
+
+    async def test_command_does_not_open_window(self):
+        # 守静默失效：指令唤醒也开窗（管理命令让 Bot 进入玩手机状态）
+        plugin = self._plugin(follow_up_window=120)
+        event = Event()
+        event.is_at_or_wake_command = True
+        event.message_obj.message_str = "/help"
+
+        await plugin.on_message(event)
+
+        self.assertNotIn(self.UMO, plugin._follow_up_start)
+
+    async def test_command_opens_when_selected(self):
+        # 守静默失效：勾了 command 却不开窗
+        plugin = self._plugin(follow_up_window=120, follow_up_triggers=["command"])
+        event = Event()
+        event.is_at_or_wake_command = True
+        event.message_obj.message_str = "/help"
+
+        await plugin.on_message(event)
+
+        self.assertIn(self.UMO, plugin._follow_up_start)
+
+class FreshnessTests(unittest.IsolatedAsyncioTestCase):
+    """回复新鲜度：消息之后涌入太多条就放弃本轮。"""
+
+    @staticmethod
+    async def _feed(plugin, count):
+        for i in range(count):
+            event = Event()
+            event.sender_id = f"2000{i}"
+            await plugin.on_message(event)
+
+    async def test_stale_message_stops_before_llm(self):
+        # 守静默失效：话题已翻篇仍回复（旧消息被追着回）
+        plugin = make_plugin(prob=0, persona_name_prob=0, max_pending_msgs=2)
+        first = Event()
+        await plugin.on_message(first)
+        await self._feed(plugin, 3)  # 之后又来了 3 条
+
+        req = ProviderRequest()
+        await plugin.inject_wake_hint(first, req)
+
+        self.assertTrue(first.is_stopped())
+
+    async def test_pending_at_limit_is_allowed(self):
+        # 守边界：恰好等于上限应当允许（差一才放弃）
+        plugin = make_plugin(prob=0, persona_name_prob=0, max_pending_msgs=2)
+        first = Event()
+        await plugin.on_message(first)
+        await self._feed(plugin, 2)  # lag=2，等于上限
+
+        req = ProviderRequest()
+        await plugin.inject_wake_hint(first, req)
+
+        self.assertFalse(first.is_stopped())
+
+
 class SimilarityTimeDecayTests(unittest.TestCase):
     MSG = "咖啡怎么手冲"
     CAND = ["手冲咖啡需要控制水温与研磨度"]
@@ -336,6 +584,27 @@ class SimilarityTimeDecayTests(unittest.TestCase):
 
 
 class CandidateWindowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reread_uses_current_user_scope(self):
+        # 守静默失效：group 模式下复读拿全群回复比对 → 用户说别人的话也被拦
+        plugin = make_plugin(history_scope="group")
+        plugin.context.query_recorder.records_by_user = {
+            None: [
+                {"role": "assistant", "content": "对别人的回复内容",
+                 "llm_status": "llm_success"},
+                {"role": "assistant", "content": "对当前用户的回复",
+                 "llm_status": "llm_success"},
+            ],
+            "10002": [
+                {"role": "assistant", "content": "对当前用户的回复",
+                 "llm_status": "llm_success"},
+            ],
+        }
+
+        reread, sims, ages = await plugin._get_bot_msgs("umo_demo", "10002")
+
+        self.assertEqual(reread, ["对当前用户的回复"])  # 复读只看当前用户触发
+        self.assertEqual(len(sims), 2)  # 相关性仍按 group 范围
+
     async def test_candidates_capped_by_history_limit(self):
         now = time.time()
         records = [
@@ -379,6 +648,7 @@ class CandidateWindowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sims), 10)
         # 用 >=：年龄按「测试取时」与「实现取时」两次 clock 之差算，可能相等
         self.assertTrue(all(a is not None and a >= 3600 for a in ages))
+
 
 class WakeHintTests(unittest.IsolatedAsyncioTestCase):
     async def test_hint_only_injected_on_wake_and_not_saved_to_history(self):

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import random
 import re
 import time
@@ -48,6 +49,51 @@ _REJECT_DEFAULT_SCOPES = ("probability", "keyword", "bored", "interest", "simila
 # 导致每条消息分词数十上百条候选、阻塞事件循环
 _BOT_MSGS_MAX_CAP = 50
 
+# 复读判定的最小有效长度（去标点后）：短句（好的/收到/谢谢）几乎必然撞上历史，
+# 拦掉反而更像故障，只对足够长的重复句生效
+_REREAD_MIN_LEN = 4
+
+# 跟随窗口的可选触发源：除了指令（管理命令，默认豁免），其余唤醒方式
+# 都会开启/刷新跟随窗口——「被唤醒了就进入玩手机状态」。
+_FOLLOW_UP_TRIGGER_OPTIONS = (
+    "at",
+    "command",
+    "persona_name",
+    "keyword",
+    "ask",
+    "bored",
+    "interest",
+    "similarity",
+    "probability",
+)
+_FOLLOW_UP_DEFAULT_TRIGGERS = (
+    "at",
+    "persona_name",
+    "keyword",
+    "ask",
+    "bored",
+    "interest",
+    "similarity",
+    "probability",
+)
+
+# 跟随窗口的概率曲线：时间因子与消息距离因子共用，均归一化到
+# shape(0)=1、shape(1)=0（constant 恒为 1）。
+_FOLLOW_UP_CURVES = ("constant", "linear", "exponential", "smooth")
+_EXP_NEG3 = math.exp(-3.0)
+
+
+def _follow_up_shape(curve: str, x: float) -> float:
+    """把 [0, 1] 的归一化进度映射成 [0, 1] 的概率系数。"""
+    x = min(1.0, max(0.0, x))
+    if curve == "constant":
+        return 1.0
+    if curve == "exponential":
+        return (math.exp(-3.0 * x) - _EXP_NEG3) / (1.0 - _EXP_NEG3)
+    if curve == "smooth":
+        return 1.0 - (3.0 * x * x - 2.0 * x * x * x)
+    return 1.0 - x  # linear
+
 
 def _clamp_float(value, default: float, minimum: float, maximum: float) -> float:
     try:
@@ -92,6 +138,51 @@ class WakeLitePlugin(Star):
             _nonnegative_int(config.get("bot_msgs_maxlen", 15), 15),
         )
         self.wake_cd = _clamp_float(config.get("wake_cd", 0.5), 0.5, 0.0, 10.0)
+        # 唤醒跟随：被唤醒后该会话进入一个「玩手机」窗口。窗口内不再追踪某个
+        # 用户，而是对每条消息独立算概率：时间因子 × 消息距离因子。
+        self.follow_up_window = _clamp_float(
+            config.get("follow_up_window", 0.0), 0.0, 0.0, 600.0
+        )
+        triggers_raw = config.get("follow_up_triggers", None)
+        if not isinstance(triggers_raw, (list, tuple, set)):
+            triggers_raw = _FOLLOW_UP_DEFAULT_TRIGGERS
+        self.follow_up_triggers: frozenset[str] = frozenset(
+            s for s in triggers_raw
+            if isinstance(s, str) and s in _FOLLOW_UP_TRIGGER_OPTIONS
+        )
+        self.follow_up_prob = _clamp_float(
+            config.get("follow_up_prob", 1.0), 1.0, 0.0, 1.0
+        )
+        curve = str(config.get("follow_up_curve", "linear") or "linear").strip().lower()
+        self.follow_up_curve = curve if curve in _FOLLOW_UP_CURVES else "linear"
+        # 消息距离因子：自己上一条回复之后隔了多少条，越远概率越低；0 = 关闭
+        self.follow_up_gap = min(
+            50, _nonnegative_int(config.get("follow_up_gap", 0), 0)
+        )
+        # 窗口内是否也响应「@他人 / 引用他人」的消息（默认不响应）
+        self.follow_up_allow_other_at = bool(
+            config.get("follow_up_allow_other_at", False)
+        )
+        # 跟随窗口黑名单：这些发送者（常用于排除群里其他机器人）不开窗，
+        # 窗口内也不参与概率响应；普通唤醒规则不受影响。
+        block_raw = config.get("follow_up_block_ids", []) or []
+        if not isinstance(block_raw, (list, tuple, set)):
+            block_raw = []
+        self.follow_up_block_ids: frozenset[str] = frozenset(
+            s.strip() for s in block_raw if isinstance(s, str) and s.strip()
+        )
+        # 回复新鲜度：该消息之后会话里又来了超过 N 条消息，就不再回复
+        # （模拟人的习惯：话题已经翻篇，懒得追旧消息；0 = 关闭）。
+        self.max_pending_msgs = min(
+            50,
+            _nonnegative_int(config.get("max_pending_msgs", 0), 0),
+        )
+        # 会话消息流计数：每收到一条消息 +1，用于新鲜度与距离因子
+        self._session_msg_seq: dict[str, int] = {}
+        self._session_seq_seen: dict[str, float] = {}
+        # 跟随窗口：umo -> 窗口起点；umo -> 自己上一条回复时的会话序号
+        self._follow_up_start: dict[str, float] = {}
+        self._last_bot_seq: dict[str, int] = {}
         self.enable_reject_tool = bool(config.get("enable_reject_tool", False))
         scopes_raw = config.get("reject_tool_scopes", None)
         if not isinstance(scopes_raw, (list, tuple, set)):
@@ -207,6 +298,12 @@ class WakeLitePlugin(Star):
             f"概率={self.prob}, 答疑={self.ask_threshold}, "
             f"无聊={self.bored_threshold}, 兴趣={self.interest_threshold}, "
             f"相关性={self.similar_threshold}, CD={self.wake_cd}s, "
+            f"跟随窗口={self.follow_up_window}s"
+            f"(触发={','.join(sorted(self.follow_up_triggers)) or '-'}"
+            f",起点={self.follow_up_prob},{self.follow_up_curve}"
+            f",距离上限={self.follow_up_gap}条"
+            f",屏蔽ID={len(self.follow_up_block_ids)}), "
+            f"新鲜度={self.max_pending_msgs}条, "
             f"白名单群={len(self.whitelist_groups)}个, "
             f"用户黑名单={len(self.blacklist_users)}条, "
             f"兴趣词包={len(self.interest_words)}个, "
@@ -279,6 +376,8 @@ class WakeLitePlugin(Star):
 
         reread 用所有 assistant（含 non_llm，覆盖复读插件），similarity 仅
         llm_success（避免模板回复污染 TF-IDF）；两者都按 bot_msgs_maxlen 截断。
+        reread 在 chat_memory 源下只取「当前用户触发的回复」，避免拿别人触发的
+        回复误判复读；回退源没有发送者维度，保持全量（不额外兜底）。
         ages 与 similarity_msgs 一一对应，无时间戳（兜底源）为 None。
         """
         if self.bot_msgs_maxlen <= 0:
@@ -296,11 +395,19 @@ class WakeLitePlugin(Star):
             if not records:
                 # chat_memory 没数据时尝试 AstrBot 自带兜底
                 records = await self._read_astrbot_history(umo, conv_id)
+            reread_records = records
+            if self.history_scope == "group":
+                user_records = await self._query_chat_memory(
+                    umo, conv_id, uid, user_scoped=True
+                )
+                if user_records:
+                    reread_records = user_records
         else:
             records = await self._read_astrbot_history(umo, conv_id)
+            reread_records = records
 
         now = time.time()
-        reread_msgs: list[str] = []
+        reread_msgs = self._assistant_texts(reread_records)
         similarity_msgs: list[str] = []
         similarity_ages: list[float | None] = []
         for r in records:
@@ -313,7 +420,6 @@ class WakeLitePlugin(Star):
             if not content:
                 continue
             ts = self._parse_created_at(r.get("created_at_utc") or r.get("created_at"))
-            reread_msgs.append(content)
             if r.get("llm_status") == "llm_success" or "llm_status" not in r:
                 similarity_msgs.append(content)
                 similarity_ages.append(None if ts is None else now - ts)
@@ -325,8 +431,27 @@ class WakeLitePlugin(Star):
             similarity_ages = similarity_ages[-self.bot_msgs_maxlen:]
         return reread_msgs, similarity_msgs, similarity_ages
 
-    async def _query_chat_memory(self, umo: str, conv_id: str, uid: str) -> list[dict]:
-        """从 chat_memory v2.3+ 查 assistant 消息，llm_status 分流交给上层。"""
+    @staticmethod
+    def _assistant_texts(records: list[dict]) -> list[str]:
+        """从记录里提取 assistant 文本（含 non_llm，供复读比对）。"""
+        texts: list[str] = []
+        for r in records:
+            if not isinstance(r, dict) or r.get("role") != "assistant":
+                continue
+            content = str(r.get("content", "")).strip()
+            content = _CTX_CLEAN_RE.sub("", content).strip()
+            if content:
+                texts.append(content)
+        return texts
+
+    async def _query_chat_memory(
+        self, umo: str, conv_id: str, uid: str, *, user_scoped: bool | None = None
+    ) -> list[dict]:
+        """从 chat_memory v2.3+ 查 assistant 消息，llm_status 分流交给上层。
+
+        user_scoped=None 时按 history_scope 决定是否过滤发送者；显式 True
+        用于复读候选（只取当前用户触发的回复）。
+        """
         star = self.context.get_registered_star("chat_memory")
         if star is None:
             return []
@@ -336,7 +461,9 @@ class WakeLitePlugin(Star):
             return []
         try:
             limit = max(self.bot_msgs_maxlen, 5)
-            user_filter = uid if self.history_scope == "user" else None
+            if user_scoped is None:
+                user_scoped = self.history_scope == "user"
+            user_filter = uid if user_scoped else None
             return await query(
                 umo,
                 conv_id,
@@ -443,14 +570,50 @@ class WakeLitePlugin(Star):
         return points_to_other and not points_to_self
 
     @staticmethod
+    def _is_at_self(event: AstrMessageEvent) -> bool:
+        """消息是否 @ 了自己或引用了自己的消息（不含 @全体）。"""
+        self_id = str(event.get_self_id())
+        for seg in event.get_messages():
+            if isinstance(seg, At):
+                if str(getattr(seg, "qq", "")) == self_id:
+                    return True
+            elif isinstance(seg, Reply):
+                if str(getattr(seg, "sender_id", "") or "") == self_id:
+                    return True
+        return False
+
+    def _is_command(self, event: AstrMessageEvent) -> bool:
+        """消息是否以核心唤醒前缀（默认 /）开头。
+
+        核心在唤醒判定时会剥离前缀并改写 event.message_str，
+        这里读 message_obj.message_str（原始文本）来区分指令唤醒。
+        """
+        obj = getattr(event, "message_obj", None)
+        raw = str(getattr(obj, "message_str", "") or "")
+        if not raw:
+            return False
+        try:
+            cfg = self.context.get_config(umo=event.unified_msg_origin) or {}
+        except Exception:
+            cfg = {}
+        prefixes = cfg.get("wake_prefix", ["/"]) or []
+        if isinstance(prefixes, str):
+            prefixes = [prefixes]
+        return any(str(p) and raw.startswith(str(p)) for p in prefixes)
+
+    @staticmethod
     def _normalize(text: str) -> str:
         """去掉标点、空白、大小写差异，用于复读比对。"""
         return re.sub(r"[^\w一-鿿]", "", text).lower()
 
     def _is_reread(self, plain: str, bot_msgs: list[str]) -> bool:
-        """用户消息与 bot 历史某条消息完全相同（去标点后）即视为复读。"""
+        """用户消息与 bot 历史某条消息完全相同（去标点后）即视为复读。
+
+        短句（去标点后 < _REREAD_MIN_LEN 字）不参与判定：好的/收到/谢谢这类
+        回复几乎必然与历史重复，拦掉反而像故障。
+        """
         cleaned = self._normalize(plain)
-        if not cleaned:
+        if len(cleaned) < _REREAD_MIN_LEN:
             return False
         for msg in bot_msgs:
             if msg and self._normalize(msg) == cleaned:
@@ -472,16 +635,71 @@ class WakeLitePlugin(Star):
             source if source in _WAKE_HINT_INTROS else None,
         )
         self._last_wake[(event.unified_msg_origin, uid)] = now
+        if (
+            self.follow_up_window > 0
+            and source in self.follow_up_triggers
+            and uid not in self.follow_up_block_ids
+        ):
+            # 开启（或刷新）会话级跟随窗口：窗口属于会话，不追某个用户
+            self._follow_up_start[event.unified_msg_origin] = now
         logger.info(f"{self._log_prefix(event)} {reason}")
+
+    def _follow_up_active(self, now: float, umo: str) -> bool:
+        """当前是否处于该会话的跟随窗口内；过期即清。"""
+        if self.follow_up_window <= 0:
+            return False
+        start = self._follow_up_start.get(umo)
+        if start is None:
+            return False
+        if 0 <= now - start < self.follow_up_window:
+            return True
+        self._follow_up_start.pop(umo, None)
+        return False
+
+    def _follow_up_hit_prob(self, umo: str, seq: int, now: float) -> float:
+        """窗口内单条消息的回复概率 = 时间因子 × 消息距离因子。
+
+        - 时间因子：从窗口起点算起，按 follow_up_curve 衰减；
+        - 距离因子：自己上一条回复之后隔了多少条消息，越远概率越低
+          （follow_up_gap 为上限，0 = 不启用；锚点缺失时不惩罚）。
+        """
+        start = self._follow_up_start.get(umo)
+        if start is None or self.follow_up_window <= 0:
+            return 0.0
+        x = (now - start) / self.follow_up_window
+        prob = self.follow_up_prob * _follow_up_shape(self.follow_up_curve, x)
+        if self.follow_up_gap > 0:
+            anchor = self._last_bot_seq.get(umo)
+            if anchor is not None:
+                gap = max(0, seq - anchor)
+                gx = min(1.0, gap / self.follow_up_gap)
+                prob *= _follow_up_shape(self.follow_up_curve, gx)
+        return max(0.0, min(1.0, prob))
 
     def _maintain_runtime_state(self, now: float) -> None:
         """惰性清理长期运行状态，避免用户/会话数量无限增长。"""
         self._runtime_ops += 1
         if self._runtime_ops % 256:
             return
-        wake_cutoff = now - max(self.wake_cd * 2, 300.0)
+        cutoff = now - max(self.wake_cd * 2, self.follow_up_window, 300.0)
         self._last_wake = {
-            key: ts for key, ts in self._last_wake.items() if ts >= wake_cutoff
+            key: ts for key, ts in self._last_wake.items() if ts >= cutoff
+        }
+        self._follow_up_start = {
+            umo: ts for umo, ts in self._follow_up_start.items() if ts >= cutoff
+        }
+        self._session_seq_seen = {
+            umo: ts for umo, ts in self._session_seq_seen.items() if ts >= cutoff
+        }
+        self._session_msg_seq = {
+            umo: seq
+            for umo, seq in self._session_msg_seq.items()
+            if umo in self._session_seq_seen
+        }
+        self._last_bot_seq = {
+            umo: seq
+            for umo, seq in self._last_bot_seq.items()
+            if umo in self._session_seq_seen
         }
 
     # ===================== 多 bot 分流 =====================
@@ -566,6 +784,19 @@ class WakeLitePlugin(Star):
     @filter.on_llm_request()
     async def inject_wake_hint(self, event: AstrMessageEvent, req: ProviderRequest):
         """为智能唤醒追加临时提示，避免模型机械续写历史角色或口吻。"""
+        # 消息新鲜度：这条消息之后会话里又来了太多条，放弃本轮（不再调用 LLM）
+        if self.max_pending_msgs > 0:
+            seq = event.get_extra("wakelite_msg_seq", None)
+            if seq is not None:
+                umo = event.unified_msg_origin
+                lag = self._session_msg_seq.get(umo, 0) - seq
+                if lag > self.max_pending_msgs:
+                    self._log(
+                        f"消息已过时，放弃回复 umo={umo} lag={lag}",
+                        event=event,
+                    )
+                    event.stop_event()
+                    return
         source = event.get_extra("wakelite_wake_source", None)
         intro = _WAKE_HINT_INTROS.get(source)
         if not intro:
@@ -627,6 +858,10 @@ class WakeLitePlugin(Star):
         最终清空与终止装饰链。
         """
         if not event.get_extra("wakelite_declined", False):
+            # 记录自己上一条回复的位置：窗口内的「消息距离」因子以它为锚点
+            if self.follow_up_window > 0 and event.get_result() is not None:
+                umo = event.unified_msg_origin
+                self._last_bot_seq[umo] = self._session_msg_seq.get(umo, 0)
             return
         logger.info(f"{self._log_prefix(event)} 已拦截发送：LLM 拒绝本轮回复")
         event.stop_event()
@@ -646,25 +881,48 @@ class WakeLitePlugin(Star):
 
         umo = event.unified_msg_origin
 
+        # 消息流计数：每条消息 +1，供新鲜度与窗口距离因子使用
+        seq = self._session_msg_seq.get(umo, 0) + 1
+        self._session_msg_seq[umo] = seq
+        self._session_seq_seen[umo] = time.time()
+        event.set_extra("wakelite_msg_seq", seq)
+
+        now = time.time()
+        self._maintain_runtime_state(now)
+        in_window = self._follow_up_active(now, umo)
+
+        # 明确指向他人（@他人 / 引用他人）：默认跳过；窗口内可配置豁免
+        if self._targets_only_others(event):
+            if not (in_window and self.follow_up_allow_other_at):
+                self._log(f"消息指向他人，跳过唤醒 umo={umo}", event=event)
+                return
+
         # 群内用户黑名单：该用户的消息不参与唤醒
         if (str(gid), str(uid)) in self.blacklist_users:
             self._log(f"用户在群内黑名单，跳过唤醒 umo={umo}", event=event)
             return
 
-        # 明确指向他人（@他人 / 引用他人）的消息不参与唤醒判定
-        if self._targets_only_others(event):
-            self._log(f"消息指向他人，跳过唤醒 umo={umo}", event=event)
+        # 核心已唤醒（@ / 指令 / 引用 Bot）：@ 与指令分开配置，未勾选的来源
+        # 不开启窗口（指令默认不算唤醒）；黑名单发送者一律不开窗。
+        if event.is_at_or_wake_command:
+            if self.follow_up_window > 0 and uid not in self.follow_up_block_ids:
+                if "at" in self.follow_up_triggers and self._is_at_self(event):
+                    self._follow_up_start[umo] = now
+                elif "command" in self.follow_up_triggers and self._is_command(event):
+                    self._follow_up_start[umo] = now
             return
 
         plain = self._get_plain(event)
         if not plain:
             return
 
-        now = time.time()
-        self._maintain_runtime_state(now)
+        # 跟随窗口内：黑名单发送者不参与（其余消息照常跑信号与概率兜底）
+        if in_window and uid in self.follow_up_block_ids:
+            self._log(f"跟随窗口内黑名单发送者，跳过 umo={umo}", event=event)
+            return
 
-        # 唤醒 CD（每用户独立）
-        if self.wake_cd > 0:
+        # 窗口外：唤醒 CD（同一用户两次唤醒的最小间隔）；窗口内由概率机制控制
+        if not in_window and self.wake_cd > 0:
             last = self._last_wake.get((umo, uid), 0.0)
             if now - last < self.wake_cd:
                 self._log(
@@ -683,8 +941,8 @@ class WakeLitePlugin(Star):
             self._log(f"复读拦截 umo={umo}", event=event)
             return
 
-        # 多 bot 分流：未轮到我则跳过阈值/概率类判定（人格名仍跑）
-        is_my_turn = self._compute_my_turn(event, uid, bid)
+        # 多 bot 分流：窗口内绕过分流（概率机制独立于轮次）
+        is_my_turn = True if in_window else self._compute_my_turn(event, uid, bid)
 
         # 1. 人格名唤醒（所有 bot 都跑，不受分流影响）
         if self.persona_name_prob > 0:
@@ -777,6 +1035,18 @@ class WakeLitePlugin(Star):
                 self._wake(event, uid, now,
                            f"相关性唤醒 umo={umo} sim={sim:.3f}", source="similarity")
                 return
+
+        # 窗口内信号全部未命中：按「时间 × 消息距离」概率兜底
+        if in_window:
+            prob = self._follow_up_hit_prob(umo, seq, now)
+            if prob > 0 and random.random() < prob:
+                self._wake(
+                    event, uid, now,
+                    f"跟随窗口命中 umo={umo} p={prob:.2f}",
+                    source="affinity",
+                )
+            else:
+                self._log(f"跟随窗口未命中 umo={umo} p={prob:.2f}", event=event)
 
     async def terminate(self):
         logger.info(f"{self._log_prefix()} 已停用")
