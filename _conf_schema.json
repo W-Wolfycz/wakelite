@@ -13,56 +13,9 @@
   },
   "blacklist_users": {
     "description": "唤醒源黑名单",
-    "type": "template_list",
+    "type": "list",
     "default": [],
-    "hint": "按 ID 屏蔽唤醒源：ID 填 QQ（所有群）或 群号:QQ（仅该群）；勾选要屏蔽的唤醒源（跟随窗口与其他信号同级）。",
-    "templates": {
-      "entry": {
-        "name": "黑名单条目",
-        "items": {
-          "id": {
-            "description": "QQ 或 群号:QQ",
-            "type": "string",
-            "default": ""
-          },
-          "sources": {
-            "description": "屏蔽的唤醒源",
-            "type": "list",
-            "options": [
-              "persona_name",
-              "keyword",
-              "ask",
-              "bored",
-              "interest",
-              "similarity",
-              "probability",
-              "window"
-            ],
-            "labels": [
-              "人格名",
-              "关键词",
-              "答疑",
-              "无聊",
-              "兴趣",
-              "相关性",
-              "概率",
-              "跟随窗口"
-            ],
-            "default": [
-              "persona_name",
-              "keyword",
-              "ask",
-              "bored",
-              "interest",
-              "similarity",
-              "probability",
-              "window"
-            ],
-            "hint": "该 ID 在这些唤醒源命中时不唤醒；默认全选。"
-          }
-        }
-      }
-    }
+    "hint": "每行一条：ID [唤醒源...]。ID 填 QQ（所有群）或 群号:QQ（仅该群），多个 ID 可用逗号合并；唤醒源可用中文或英文（人格名/关键词/答疑/无聊/兴趣/相关性/概率/跟随窗口），留空 = 全部屏蔽。例：10001 或 10002,10003 关键词 概率"
   },
   "group_bots": {
     "description": "多 bot 分流（按群）",

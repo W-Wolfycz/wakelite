@@ -2,7 +2,7 @@ name: wakelite
 display_name: 轻量唤醒
 short_desc: 群聊智能唤醒判定，多信号命中后决定 Bot 是否响应
 desc: 在群聊中决定 Bot 要不要响应一条消息：人格名/关键词/概率/答疑/无聊/兴趣/相关性 7 个唤醒信号，含群白名单、唤醒 CD、唤醒跟随窗口、复读过滤、按群多 Bot 分流，支持唤醒后让 LLM 主动拒绝回复。
-version: 1.4.0
+version: 1.4.1
 author: wolfycz
 repo: https://github.com/W-Wolfycz/wakelite
 tags: ["唤醒", "群聊", "多bot", "概率判定", "拒绝回复"]
