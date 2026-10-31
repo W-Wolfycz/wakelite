@@ -66,6 +66,19 @@ _WAKE_SOURCE_OPTIONS = (
     "window",
 )
 
+# 黑名单 list 行里允许写中文源名（配置页/手写都更直观）
+_SOURCE_ALIASES = {
+    "人格名": "persona_name",
+    "关键词": "keyword",
+    "答疑": "ask",
+    "无聊": "bored",
+    "兴趣": "interest",
+    "相关性": "similarity",
+    "概率": "probability",
+    "跟随窗口": "window",
+    "窗口": "window",
+}
+
 
 # 跟随窗口的概率曲线：时间因子与消息距离因子共用，均归一化到
 # shape(0)=1、shape(1)=0（constant 恒为 1）。
@@ -87,21 +100,82 @@ def _follow_up_shape(curve: str, x: float) -> float:
     return 1.0 - x  # linear
 
 
-def _normalize_blacklist_entries(raw) -> list[dict]:
-    """把黑名单配置归一化为 template_list 结构。
+def _parse_blacklist_line(line: str) -> list[dict]:
+    """解析一行黑名单：`ID[,ID...] [源...]`。
 
-    兼容三类来源：
-    - 新 template：{"id": "...", "sources": [...]}
-    - 1.3.7 跟随黑名单：{"id": "...", "scopes": [...]}（丢弃 @/指令，保留信号与窗口）
-    - 旧版纯 ID 列表：["群号:QQ", ...]（全部唤醒源）
+    - ID 填 `QQ`（所有群）或 `群号:QQ`（仅该群），多个 ID 用逗号合并；
+    - 源留空 = 全部唤醒源；源可用英文 key 或中文名，逗号/空格分隔；
+    - 未知源名忽略；整行以 # 开头视为注释。
+    """
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return []
+    parts = line.split(None, 1)
+    ids = [sid.strip() for sid in parts[0].split(",") if sid.strip()]
+    if not ids:
+        return []
+    sources: list[str] = []
+    if len(parts) > 1:
+        for token in re.split(r"[\s,，]+", parts[1].strip()):
+            if not token:
+                continue
+            source = _SOURCE_ALIASES.get(token, token)
+            if source in _WAKE_SOURCE_OPTIONS and source not in sources:
+                sources.append(source)
+    if not sources:
+        sources = list(_WAKE_SOURCE_OPTIONS)
+    return [{"id": sid, "sources": sources} for sid in ids]
+
+
+def _format_blacklist_entries(entries: list[dict]) -> list[dict]:
+    """把内部条目写回 template 结构：相同唤醒源的 QQ 合并进一个 ids 列表。"""
+    grouped: dict[tuple[str, ...], list[str]] = {}
+    order: list[tuple[str, ...]] = []
+    for entry in entries:
+        sid = str(entry.get("id", "")).strip()
+        if not sid:
+            continue
+        sources = tuple(
+            s
+            for s in entry["sources"]
+            if isinstance(s, str) and s in _WAKE_SOURCE_OPTIONS
+        )
+        if not sources:
+            sources = tuple(_WAKE_SOURCE_OPTIONS)
+        if sources not in grouped:
+            grouped[sources] = []
+            order.append(sources)
+        if sid not in grouped[sources]:
+            grouped[sources].append(sid)
+    return [
+        {"__template_key": "entry", "ids": grouped[key], "sources": list(key)}
+        for key in order
+    ]
+
+
+def _normalize_blacklist_entries(raw) -> list[dict]:
+    """把黑名单配置归一化为内部条目（id + sources）。
+
+    兼容四类来源：
+    - 新 template 条目：{"ids": ["QQ", ...], "sources": [...]}（QQ 可多个）；
+    - 1.4.0 template 条目：{"id": "QQ", "sources": [...]}；
+    - 1.3.7 分组条目：{"id": "QQ", "scopes": [...]}（丢弃 @/指令）；
+    - 1.4.1 list 行 / 更早的纯 ID 列表：`"群号:QQ 源1,源2"`。
     """
     result: list[dict] = []
     if not isinstance(raw, list):
         return result
     for item in raw:
-        if isinstance(item, dict):
-            sid = str(item.get("id", "")).strip()
-            if not sid:
+        if isinstance(item, str):
+            result.extend(_parse_blacklist_line(item))
+        elif isinstance(item, dict):
+            ids_raw = item.get("ids")
+            if isinstance(ids_raw, (list, tuple, set)):
+                ids = [str(x).strip() for x in ids_raw if str(x).strip()]
+            else:
+                ids = [str(item.get("id", "")).strip()]
+            ids = [sid for sid in ids if sid]
+            if not ids:
                 continue
             sources = item.get("sources")
             if not isinstance(sources, (list, tuple, set)):
@@ -113,20 +187,17 @@ def _normalize_blacklist_entries(raw) -> list[dict]:
                 for s in sources
                 if isinstance(s, str) and s in _WAKE_SOURCE_OPTIONS
             ]
-            result.append(
-                {"id": sid, "sources": valid or list(_WAKE_SOURCE_OPTIONS)}
-            )
-        elif isinstance(item, str) and item.strip():
-            result.append(
-                {"id": item.strip(), "sources": list(_WAKE_SOURCE_OPTIONS)}
-            )
+            for sid in ids:
+                result.append(
+                    {"id": sid, "sources": valid or list(_WAKE_SOURCE_OPTIONS)}
+                )
     return result
 
 
 def _write_back_blacklist(config, entries: list[dict]) -> None:
     """把迁移后的黑名单写回 blacklist_users 并清理旧位置；失败只记日志。"""
     try:
-        config["blacklist_users"] = entries
+        config["blacklist_users"] = _format_blacklist_entries(entries)
         config["follow_up_block_ids"] = []
         follow = config.get("follow_up")
         if isinstance(follow, dict) and follow.get("block_ids"):
@@ -173,10 +244,13 @@ def _migrate_blacklist_config(config) -> list[dict]:
     add(old_group)
     entries = [{"id": sid, "sources": sorted(merged[sid])} for sid in order]
     top_raw = config.get("blacklist_users")
-    top_is_template = isinstance(top_raw, list) and all(
-        isinstance(x, dict) for x in top_raw
+    top_is_new = isinstance(top_raw, list) and all(
+        isinstance(x, dict)
+        and x.get("__template_key") == "entry"
+        and "ids" in x
+        for x in top_raw
     )
-    if not top_is_template or old_top or old_group:
+    if not top_is_new or old_top or old_group:
         _write_back_blacklist(config, entries)
     return entries
 
@@ -772,6 +846,10 @@ class WakeLitePlugin(Star):
             and source in _WAKE_SOURCE_OPTIONS
         ):
             self._follow_up_start[event.unified_msg_origin] = now
+            self._log(
+                f"启动/刷新跟随窗口 umo={event.unified_msg_origin} source={source}",
+                event=event,
+            )
         logger.info(f"{self._log_prefix(event)} {reason}")
 
     def _follow_up_active(self, now: float, umo: str) -> bool:
@@ -1022,12 +1100,16 @@ class WakeLitePlugin(Star):
             if self.follow_up_enabled and self.follow_up_window > 0:
                 if self._is_at_self(event):
                     self._follow_up_start[umo] = now
+                    self._log(f"核心唤醒（@）启动/刷新跟随窗口 umo={umo}", event=event)
                 elif self.follow_up_command and self._is_command(event):
                     self._follow_up_start[umo] = now
+                    self._log(f"核心唤醒（指令）启动/刷新跟随窗口 umo={umo}", event=event)
+            self._log(f"核心唤醒，跳过唤醒判定 umo={umo}", event=event)
             return
 
         plain = self._get_plain(event)
         if not plain:
+            self._log(f"空消息跳过 umo={umo}", event=event)
             return
 
         # 窗口外：唤醒 CD（同一用户两次唤醒的最小间隔）；窗口内由概率机制控制
@@ -1070,6 +1152,11 @@ class WakeLitePlugin(Star):
                     f"人格名命中但概率未过 umo={umo} name={persona_name}",
                     event=event,
                 )
+            else:
+                self._log(
+                    f"人格名未命中 umo={umo} name={persona_name or '无'}",
+                    event=event,
+                )
 
         # 下面 6 项受多 bot 分流影响：未轮到我则跳过
         if not is_my_turn:
@@ -1090,11 +1177,17 @@ class WakeLitePlugin(Star):
                     f"关键词命中但概率未过 umo={umo} keyword={hit}",
                     event=event,
                 )
+            else:
+                self._log(f"关键词未命中 umo={umo}", event=event)
 
         # 3. 概率唤醒
-        if self.prob > 0 and random.random() < self.prob:
-            self._wake(event, uid, now, f"概率唤醒 umo={umo}", source="probability")
-            return
+        if self.prob > 0:
+            if random.random() < self.prob:
+                self._wake(
+                    event, uid, now, f"概率唤醒 umo={umo}", source="probability"
+                )
+                return
+            self._log(f"概率唤醒未命中 umo={umo} p={self.prob}", event=event)
 
         # 4. 答疑唤醒
         if self.ask_threshold < 1:
@@ -1107,6 +1200,11 @@ class WakeLitePlugin(Star):
                 self._wake(event, uid, now,
                            f"答疑唤醒 umo={umo} score={score:.3f}", source="ask")
                 return
+            self._log(
+                f"答疑未过阈值 umo={umo} score={score:.3f}"
+                f" threshold={self.ask_threshold}",
+                event=event,
+            )
 
         # 5. 无聊唤醒
         if self.bored_threshold < 1:
@@ -1119,6 +1217,11 @@ class WakeLitePlugin(Star):
                 self._wake(event, uid, now,
                            f"无聊唤醒 umo={umo} score={score:.3f}", source="bored")
                 return
+            self._log(
+                f"无聊未过阈值 umo={umo} score={score:.3f}"
+                f" threshold={self.bored_threshold}",
+                event=event,
+            )
 
         # 6. 兴趣唤醒
         if self.interest_threshold < 1 and self.interest_words:
@@ -1131,6 +1234,11 @@ class WakeLitePlugin(Star):
                 self._wake(event, uid, now,
                            f"兴趣唤醒 umo={umo} score={score:.3f}", source="interest")
                 return
+            self._log(
+                f"兴趣未过阈值 umo={umo} score={score:.3f}"
+                f" threshold={self.interest_threshold}",
+                event=event,
+            )
 
         # 7. 相关性唤醒（仅比对 LLM 回复，带时间衰减）
         if self.similar_threshold < 1 and similarity_msgs:
@@ -1148,6 +1256,11 @@ class WakeLitePlugin(Star):
                 self._wake(event, uid, now,
                            f"相关性唤醒 umo={umo} sim={sim:.3f}", source="similarity")
                 return
+            self._log(
+                f"相关性未过阈值 umo={umo} sim={sim:.3f}"
+                f" threshold={self.similar_threshold}",
+                event=event,
+            )
 
         # 窗口内信号全部未命中：按「时间 × 消息距离」概率兜底。
         # 窗口判定命中的唤醒与其他唤醒源同级，黑名单的 sources 含 window。

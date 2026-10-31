@@ -479,7 +479,7 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
         plugin = self._plugin(
             follow_up_window=120,
             follow_up_prob=1.0,
-            blacklist_users=[{"id": "10003", "sources": ["window"]}],
+            blacklist_users=[{"ids": ["10003"], "sources": ["window"]}],
         )
         plugin._follow_up_start[self.UMO] = time.time()
         event = Event()
@@ -631,7 +631,7 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
             follow_up_window=120,
             keyword_prob=1.0,
             keyword_words=["咖啡"],
-            blacklist_users=[{"id": "10003", "sources": ["keyword"]}],
+            blacklist_users=[{"__template_key": "entry", "ids": ["10003"], "sources": ["keyword"]}],
         )
         event = Event()
         event.sender_id = "10003"
@@ -655,7 +655,7 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
             follow_up_window=120,
             keyword_prob=1.0,
             keyword_words=["咖啡"],
-            blacklist_users=[{"id": "10003", "sources": []}],
+            blacklist_users=[{"ids": ["10003"], "sources": []}],
         )
         event = Event()
         event.sender_id = "10003"
@@ -687,11 +687,16 @@ class BlockMigrationTests(unittest.TestCase):
         )
 
     def test_migrate_writeback_from_legacy_list(self):
-        # 守静默失效：旧列表没写回新键（重启后又变回旧格式）
+        # 守静默失效：旧列表没写回 template（重启后又变回旧格式）
         config = {"blacklist_users": ["group_demo:10003"]}
         entries = plugin_main._migrate_blacklist_config(config)
         self.assertEqual(entries[0]["id"], "group_demo:10003")
-        self.assertIsInstance(config["blacklist_users"][0], dict)
+        self.assertEqual(
+            config["blacklist_users"],
+            [{"__template_key": "entry", "ids": ["group_demo:10003"], "sources": sorted(
+                plugin_main._WAKE_SOURCE_OPTIONS
+            )}],
+        )
 
     def test_migrate_flat_follow_up_config(self):
         # 守静默失效：旧平铺配置没迁移到分组（窗口配置丢失/未启用）
@@ -740,13 +745,28 @@ class BlockMigrationTests(unittest.TestCase):
         self.assertEqual([e["id"] for e in entries], ["group_demo:10003", "10004"])
         self.assertEqual(len(config["blacklist_users"]), 2)
 
-    def test_new_template_is_kept(self):
+    def test_legacy_ids_merge_into_one_entry(self):
+        # 守静默失效：同一唤醒源的多个 QQ 没合并进一个 ids 列表（只留最后一个）
+        config = {"blacklist_users": ["10003", "10004"]}
+        plugin_main._migrate_blacklist_config(config)
+        self.assertEqual(
+            config["blacklist_users"],
+            [{"__template_key": "entry", "ids": ["10003", "10004"], "sources": sorted(
+                plugin_main._WAKE_SOURCE_OPTIONS
+            )}],
+        )
+
+    def test_template_writeback_to_ids_list(self):
+        # 守静默失效：1.4.0 template 条目没转成 ids 列表（QQ 列表丢失）
         config = {
             "blacklist_users": [{"id": "10003", "sources": ["keyword"]}]
         }
         entries = plugin_main._migrate_blacklist_config(config)
         self.assertEqual(entries[0]["sources"], ["keyword"])
-        self.assertIsInstance(config["blacklist_users"][0], dict)
+        self.assertEqual(
+            config["blacklist_users"],
+            [{"__template_key": "entry", "ids": ["10003"], "sources": ["keyword"]}],
+        )
 
 
 class SimilarityTimeDecayTests(unittest.TestCase):
@@ -910,16 +930,28 @@ class OnMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(event.is_at_or_wake_command)
 
     def test_blacklist_entries_parsed(self):
-        # 守静默失效：黑名单条目解析失败（QQ / 群号:QQ）
+        # 守静默失效：template 条目解析失败（ids 列表 / 中文源 / 留空 = 全部）
         plugin = make_plugin(
             blacklist_users=[
-                {"id": "10003", "sources": ["keyword"]},
-                {"id": "group_demo:10004", "sources": ["window"]},
+                {"ids": ["10003"], "sources": ["keyword"]},
+                {"ids": ["group_demo:10004"], "sources": ["window"]},
+                {"ids": ["10005", "10006"], "sources": ["keyword", "probability"]},
+                {"ids": ["10007"], "sources": []},
             ]
         )
         self.assertEqual(plugin._wake_blacklist["10003"], frozenset({"keyword"}))
         self.assertEqual(
             plugin._wake_blacklist["group_demo:10004"], frozenset({"window"})
+        )
+        self.assertEqual(
+            plugin._wake_blacklist["10005"], frozenset({"keyword", "probability"})
+        )
+        self.assertEqual(
+            plugin._wake_blacklist["10006"], frozenset({"keyword", "probability"})
+        )
+        self.assertEqual(
+            plugin._wake_blacklist["10007"],
+            frozenset(m for m in plugin_main._WAKE_SOURCE_OPTIONS),
         )
 
     async def test_mention_other_skips_wake(self):
