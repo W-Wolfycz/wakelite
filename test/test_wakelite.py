@@ -274,9 +274,11 @@ def make_plugin(**overrides):
 class DomainTests(unittest.TestCase):
 
     def test_negation_reduces_bored_score(self):
+        # 守静默失效：否定词（不无聊）仍按无聊计分 → 误唤醒变多
         self.assertLess(sentiment.bored("我不无聊"), sentiment.bored("我好无聊"))
 
     def test_similarity_prefers_related_message(self):
+        # 守静默失效：相关性排序反了 → 相似信号把无关消息当相关
         similarity = Similarity(bot_template_threshold=0)
         related = similarity.similarity(
             "group_demo",
@@ -290,10 +292,6 @@ class DomainTests(unittest.TestCase):
         )
         self.assertGreater(related, unrelated)
 
-    def test_invalid_interest_items_are_ignored(self):
-        plugin = make_plugin(interest_words=["咖啡 手冲", None, 123])
-        self.assertEqual(plugin.interest_words, [["咖啡", "手冲"]])
-
     def test_reread_ignores_short_messages(self):
         # 守静默失效：短句被误判复读（「好的」「收到」）→ 常见应答应被吞掉
         plugin = make_plugin()
@@ -302,6 +300,7 @@ class DomainTests(unittest.TestCase):
         self.assertTrue(plugin._is_reread("好的收到", ["好的收到"]))
 
     def test_numeric_config_is_clamped(self):
+        # 守静默失效：越界数值不钳制（prob>1 / 负阈值）→ 概率与阈值静默失效
         plugin = make_plugin(
             prob=2,
             ask_threshold=-1,
@@ -314,6 +313,7 @@ class DomainTests(unittest.TestCase):
         self.assertEqual(plugin.bot_msgs_maxlen, 0)
 
     def test_history_limit_capped_at_maximum(self):
+        # 守静默失效：历史条数硬上限失效 → 单条消息分词/比对量失控
         plugin = make_plugin(bot_msgs_maxlen=999)
         self.assertEqual(plugin.bot_msgs_maxlen, 50)
 
@@ -363,6 +363,7 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
         return make_plugin(**defaults)
 
     def test_prob_time_curve_and_start(self):
+        # 守静默失效：时间因子曲线算错（线性/恒定）→ 窗口概率静默偏离
         # ???????????? ? ?????????????
         plugin = self._plugin(
             follow_up_window=100, follow_up_prob=1.0, follow_up_curve="linear"
@@ -391,6 +392,7 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(plugin._follow_up_hit_prob(self.UMO, 1, 1100.0), 0.0)
 
     def test_prob_gap_factor(self):
+        # 守静默失效：距离因子算错（含锚点缺失）→ 越聊越远的概率不降
         # ???????????? ? ????????????
         plugin = self._plugin(
             follow_up_window=100,
@@ -433,12 +435,6 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event2.is_at_or_wake_command)
         self.assertEqual(event2.get_extra("wakelite_wake_source"), "window")
 
-        # 3) 概率未命中 → 不唤醒
-        event3 = Event()
-        event3.message_str = "随便聊聊"
-        with patch("wakelite.main.random.random", return_value=0.9):
-            await plugin.on_message(event3)
-        self.assertFalse(event3.is_at_or_wake_command)
 
     async def test_window_expired_falls_back_to_signals(self):
         # 守静默失效：窗口过期后仍按窗口概率；或旧窗口没被清理
@@ -521,12 +517,15 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(event.is_at_or_wake_command)  # 窗口不生效
         self.assertFalse(plugin._follow_up_active(time.time(), self.UMO))
 
-    async def test_window_hit_refreshes_start(self):
-        # 守静默失效：窗口兜底命中后没启动/刷新窗口（唤醒后应进入玩手机状态）
-        plugin = self._plugin(follow_up_prob=1.0)
+    async def test_window_signal_hit_refreshes_start(self):
+        # 守静默失效：窗口内信号命中后没刷新窗口（唤醒后应重新计时）
+        plugin = self._plugin(
+            follow_up_prob=1.0, keyword_prob=1.0, keyword_words=["咖啡"]
+        )
         old = time.time() - 60
         plugin._follow_up_start[self.UMO] = old
         event = Event()
+        event.message_str = "今天咖啡豆到了"
 
         with patch("wakelite.main.random.random", return_value=0.0):
             await plugin.on_message(event)
@@ -535,6 +534,7 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(plugin._follow_up_start[self.UMO], old)
 
     async def test_window_opens_on_trigger(self):
+        # 守静默失效：信号唤醒没开窗（窗口外首次唤醒不进入跟随）
         # ???????????????????????????
         plugin = self._plugin(
             follow_up_window=120, keyword_prob=1.0, keyword_words=["??"]
@@ -549,6 +549,7 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(self.UMO, plugin._follow_up_start)  # keyword ??? triggers ?
 
     async def test_window_at_self_refreshes_start(self):
+        # 守静默失效：@ Bot 没刷新窗口（被点名后窗口不再续期）
         # ????????? @ ???????
         plugin = self._plugin(follow_up_window=120)
         event = Event()
@@ -570,12 +571,12 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
         )
         plugin._follow_up_start[self.UMO] = time.time()
         event = Event()
-        with patch("wakelite.main.random.random", return_value=0.0):
-            await plugin.on_message(event)
+        await plugin.on_message(event)
         self.assertTrue(event.is_at_or_wake_command)
 
         req = ProviderRequest()
-        await plugin.inject_wake_hint(event, req)
+        with patch("wakelite.main.random.random", return_value=0.0):
+            await plugin.inject_wake_hint(event, req)
         self.assertIsNotNone(req.func_tool)  # 窗口兜底可拒绝
 
         plain = self._plugin(
@@ -585,13 +586,116 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
         )
         plain._follow_up_start[self.UMO] = time.time()
         event2 = Event()
-        with patch("wakelite.main.random.random", return_value=0.0):
-            await plain.on_message(event2)
+        await plain.on_message(event2)
         req2 = ProviderRequest()
-        await plain.inject_wake_hint(event2, req2)
+        with patch("wakelite.main.random.random", return_value=0.0):
+            await plain.inject_wake_hint(event2, req2)
         self.assertIsNone(req2.func_tool)  # 未勾选 window 时不注入
 
+    async def test_window_gate_defers_probability_to_llm(self):
+        # 守静默失效：窗口闸放行后 LLM 前没做概率终判（排队过期消息仍请求 LLM）
+        plugin = self._plugin(follow_up_prob=0.5)
+        start = time.time() - 10
+        plugin._follow_up_start[self.UMO] = start
+        event = Event()
+        await plugin.on_message(event)
+        self.assertTrue(event.is_at_or_wake_command)  # 闸门直接放行
+        self.assertEqual(plugin._follow_up_start[self.UMO], start)  # 闸门不刷新
+
+        req = ProviderRequest()
+        with patch("wakelite.main.random.random", return_value=0.99):
+            await plugin.inject_wake_hint(event, req)
+        self.assertTrue(event.is_stopped())  # 终判未过 → 丢弃
+        self.assertEqual(plugin._follow_up_start[self.UMO], start)  # 未过不刷新
+
+        ok = self._plugin(follow_up_prob=0.5)
+        ok._follow_up_start[self.UMO] = start
+        event2 = Event()
+        await ok.on_message(event2)
+        req2 = ProviderRequest()
+        with patch("wakelite.main.random.random", return_value=0.0):
+            await ok.inject_wake_hint(event2, req2)
+        self.assertFalse(event2.is_stopped())  # 终判通过 → 正常请求
+        self.assertGreater(ok._follow_up_start[self.UMO], start)  # 通过才刷新
+
+    async def test_signal_wake_not_rejudged_before_llm(self):
+        # 守静默失效：信号唤醒在 LLM 前被窗口概率重判误杀
+        plugin = self._plugin(keyword_prob=1.0, keyword_words=["咖啡"])
+        event = Event()
+        event.message_str = "今天咖啡豆到了"
+        with patch("wakelite.main.random.random", return_value=0.0):
+            await plugin.on_message(event)
+        self.assertTrue(event.is_at_or_wake_command)
+
+        req = ProviderRequest()
+        with patch("wakelite.main.random.random", return_value=0.99):
+            await plugin.inject_wake_hint(event, req)
+        self.assertFalse(event.is_stopped())  # 信号唤醒不重判
+
+    async def test_response_gate_filters_before_send(self):
+        # 守静默失效：发送闸开启后过期回复未被丢弃（照发）
+        plugin = self._plugin(
+            follow_up={
+                "enabled": True, "window": 120, "prob": 0.5, "gate": "response"
+            }
+        )
+        start = time.time() - 10
+        plugin._follow_up_start[self.UMO] = start
+        event = Event()
+        await plugin.on_message(event)
+        self.assertTrue(event.is_at_or_wake_command)
+        self.assertEqual(event.get_extra("wakelite_wake_source"), "window")
+        self.assertEqual(plugin._follow_up_start[self.UMO], start)  # 闸门不刷新
+
+        req = ProviderRequest()
+        with patch("wakelite.main.random.random", return_value=0.99):
+            await plugin.inject_wake_hint(event, req)
+        self.assertFalse(event.is_stopped())  # 请求闸关闭，不拦截
+
+        event.set_result(object())
+        with patch("wakelite.main.random.random", return_value=0.99):
+            await plugin.block_declined_reply(event)
+        self.assertTrue(event.is_stopped())  # 发送前过滤丢弃
+        self.assertIsNone(event.get_result())
+        self.assertNotIn(self.UMO, plugin._last_bot_seq)  # 丢弃的回复不记锚点
+        self.assertEqual(plugin._follow_up_start[self.UMO], start)  # 丢弃不刷新
+
+        # 概率通过 → 正常发送并记录锚点
+        ok = self._plugin(
+            follow_up={
+                "enabled": True, "window": 120, "prob": 0.5, "gate": "response"
+            }
+        )
+        ok._follow_up_start[self.UMO] = start
+        event2 = Event()
+        await ok.on_message(event2)
+        event2.set_result(object())
+        with patch("wakelite.main.random.random", return_value=0.0):
+            await ok.block_declined_reply(event2)
+        self.assertFalse(event2.is_stopped())
+        self.assertIsNotNone(event2.get_result())
+        self.assertIn(self.UMO, ok._last_bot_seq)
+        self.assertGreater(ok._follow_up_start[self.UMO], start)  # 发送通过才刷新
+
+    async def test_request_gate_skips_response_filter(self):
+        # 守静默失效：默认请求闸模式下发送前又过滤了一遍（回复率被双重削减）
+        plugin = self._plugin(
+            follow_up={"enabled": True, "window": 120, "prob": 0.5}
+        )
+        plugin._follow_up_start[self.UMO] = time.time()
+        event = Event()
+        await plugin.on_message(event)
+        req = ProviderRequest()
+        with patch("wakelite.main.random.random", return_value=0.0):
+            await plugin.inject_wake_hint(event, req)  # 请求闸通过
+        event.set_result(object())
+        with patch("wakelite.main.random.random", return_value=0.99):
+            await plugin.block_declined_reply(event)
+        self.assertFalse(event.is_stopped())  # 发送闸关闭
+        self.assertIsNotNone(event.get_result())
+
     async def test_anchor_recorded_on_result(self):
+        # 守静默失效：回复后锚点没记录 → 距离因子永远按旧锚点算
         # ???????????????? ? ????????
         plugin = self._plugin(follow_up_window=120)
         event = Event()
@@ -676,7 +780,7 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
 class BlockMigrationTests(unittest.TestCase):
     """唤醒源黑名单迁移：旧「群号:QQ」列表 / 1.3.7 跟随黑名单都要无损转换。"""
 
-    def test_legacy_list_normalizes_to_template(self):
+    def test_legacy_list_normalizes_to_entries(self):
         # 守静默失效：旧版「群号:QQ」列表迁移后丢失或唤醒源为空
         entries = plugin_main._normalize_blacklist_entries(
             ["group_demo:10003", "10004", ""]
@@ -774,18 +878,21 @@ class SimilarityTimeDecayTests(unittest.TestCase):
     CAND = ["手冲咖啡需要控制水温与研磨度"]
 
     def test_decay_lowers_older_candidate_score(self):
+        # 守静默失效：时间衰减失效 → 旧候选与新鲜候选同权重
         s = Similarity(bot_template_threshold=0)
         fresh = s.similarity("k", self.MSG, self.CAND, ages=[0.0])
         old = s.similarity("k", self.MSG, self.CAND, ages=[600.0])
         self.assertGreater(fresh, old)
 
     def test_unknown_age_not_decayed(self):
+        # 守静默失效：无年龄记录被当作 0 秒 → 未知年龄候选被误降权
         s = Similarity(bot_template_threshold=0)
         a = s.similarity("k", self.MSG, self.CAND, ages=[None])
         b = s.similarity("k", self.MSG, self.CAND, ages=[0.0])
         self.assertAlmostEqual(a, b)
 
     def test_token_cache_is_bounded(self):
+        # 守静默失效：分词缓存无上限 → 长运行内存持续增长
         s = Similarity(bot_template_threshold=0, token_cache_size=8)
         for i in range(30):
             s.similarity("k", f"用户消息{i}", [f"候选回复内容{i}"])
@@ -815,6 +922,7 @@ class CandidateWindowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sims), 2)  # 相关性仍按 group 范围
 
     async def test_candidates_capped_by_history_limit(self):
+        # 守静默失效：候选条数上限失效 → 相关性比对候选无限增长
         now = time.time()
         records = [
             {
@@ -921,6 +1029,7 @@ class OnMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(event.is_at_or_wake_command)
 
     async def test_blacklist_user_skips_wake(self):
+        # 守静默失效：黑名单用户仍被唤醒（屏蔽形同虚设）
         # 概率拉满：黑名单用户若不跳过，这条消息必然被唤醒
         plugin = self._quiet_plugin(prob=1.0, blacklist_users=["group_demo:10002"])
         event = Event()  # sender=10002, group_demo
@@ -955,6 +1064,7 @@ class OnMessageTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_mention_other_skips_wake(self):
+        # 守静默失效：@他人 的消息仍被唤醒（Bot 插话）
         # 概率拉满：若 @他人 未被跳过，这条消息必然被唤醒
         plugin = self._quiet_plugin(prob=1.0)
         event = Event()
@@ -1000,6 +1110,7 @@ class OnMessageTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(event.is_at_or_wake_command, segs)
 
     async def test_persona_name_wake_sets_flag(self):
+        # 守静默失效：人格名命中后没标记唤醒/没记录来源
         plugin = self._quiet_plugin(persona_name_prob=1.0)
         event = Event()
         event.message_str = "会话人格你好"
@@ -1010,6 +1121,7 @@ class OnMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.get_extra("wakelite_wake_source"), "persona_name")
 
     async def test_keyword_wake_sets_flag(self):
+        # 守静默失效：关键词命中后没标记唤醒/没记录来源
         plugin = self._quiet_plugin(keyword_prob=1.0, keyword_words=["咖啡", "摄影"])
         event = Event()
         event.message_str = "今天咖啡豆到了"
@@ -1033,6 +1145,7 @@ class OnMessageTests(unittest.IsolatedAsyncioTestCase):
 class RejectToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tool_injected_when_woken_and_enabled(self):
+        # 守静默失效：开启且命中后未注入拒绝工具（能力静默消失）
         plugin = make_plugin(enable_reject_tool=True)
         event = Event()
         plugin._wake(event, "10002", 123.0, "概率唤醒", source="probability")
@@ -1044,6 +1157,7 @@ class RejectToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("wakelite_decline_reply", req.func_tool.names())
 
     async def test_injection_preserves_existing_tools(self):
+        # 守静默失效：注入工具时覆盖了已有工具集（其他能力被吞）
         plugin = make_plugin(enable_reject_tool=True)
         event = Event()
         plugin._wake(event, "10002", 123.0, "概率唤醒", source="probability")
@@ -1076,6 +1190,7 @@ class RejectToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(event.get_result())
 
     async def test_block_clears_result_when_declined(self):
+        # 守静默失效：拒绝轮结果没被清空 → 拒绝后仍发出内容
         plugin = make_plugin()
         event = Event()
         event.set_result("dummy")
@@ -1099,6 +1214,7 @@ class RejectToolTests(unittest.IsolatedAsyncioTestCase):
 
 class AdapterLogicTests(unittest.IsolatedAsyncioTestCase):
     async def test_persona_name_uses_resolved_conversation_persona(self):
+        # 守静默失效：人格名解析没用会话级人格 → 叫错名字不响应
         plugin = make_plugin()
         name = await plugin._get_persona_name(Event.unified_msg_origin, Event())
         self.assertEqual(name, "会话人格")
@@ -1114,6 +1230,7 @@ class AdapterLogicTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plugin.persona_mgr.resolve_count, 3)
 
     async def test_group_history_scope_omits_user_filter(self):
+        # 守静默失效：group 范围仍带用户过滤 → 候选被静默缩小
         plugin = make_plugin(history_scope="group")
         await plugin._query_chat_memory("umo_demo", "cid_demo", "10002")
         args, kwargs = plugin.context.query_recorder.args

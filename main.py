@@ -372,6 +372,11 @@ class WakeLitePlugin(Star):
         self.follow_up_allow_other_at = bool(
             follow_cfg.get("allow_other_at", False)
         )
+        # 窗口闸位置：request = LLM 请求前终判；response = 发送前过滤
+        gate = str(follow_cfg.get("gate", "request") or "request").strip().lower()
+        self.follow_up_window_gate = (
+            gate if gate in ("request", "response") else "request"
+        )
         # 会话消息流计数：每收到一条消息 +1，供窗口距离因子使用
         self._session_msg_seq: dict[str, int] = {}
         self._session_seq_seen: dict[str, float] = {}
@@ -843,7 +848,7 @@ class WakeLitePlugin(Star):
         if (
             self.follow_up_enabled
             and self.follow_up_window > 0
-            and source in _WAKE_SOURCE_OPTIONS
+            and source in _WAKE_HINT_INTROS
         ):
             self._follow_up_start[event.unified_msg_origin] = now
             self._log(
@@ -993,6 +998,24 @@ class WakeLitePlugin(Star):
     async def inject_wake_hint(self, event: AstrMessageEvent, req: ProviderRequest):
         """为智能唤醒追加临时提示；跟随窗口只注入拒绝工具、不加唤醒提示。"""
         source = event.get_extra("wakelite_wake_source", None)
+        # 窗口闸放行的消息：request 模式在 LLM 请求前终判
+        if source == "window" and self.follow_up_window_gate == "request":
+            umo = event.unified_msg_origin
+            now = time.time()
+            seq = self._session_msg_seq.get(umo, 0)
+            prob = self._follow_up_hit_prob(umo, seq, now)
+            if prob <= 0 or random.random() >= prob:
+                self._log(
+                    f"排队期间窗口已过期/概率未过，放弃 LLM 请求 "
+                    f"umo={umo} p={prob:.2f}",
+                    event=event,
+                )
+                event.stop_event()
+                return
+            # 判定成功 → 续期
+            if self.follow_up_enabled and self.follow_up_window > 0:
+                self._follow_up_start[umo] = now
+                self._log(f"请求前判定通过，刷新跟随窗口 umo={umo}", event=event)
         intro = _WAKE_HINT_INTROS.get(source)
         # 拒绝工具对配置范围内的唤醒源注入（跟随窗口也可单独允许）
         reject_allowed = self.enable_reject_tool and source in self.reject_tool_scopes
@@ -1056,6 +1079,29 @@ class WakeLitePlugin(Star):
         最终清空与终止装饰链。
         """
         if not event.get_extra("wakelite_declined", False):
+            if (
+                self.follow_up_enabled
+                and self.follow_up_window_gate == "response"
+                and event.get_extra("wakelite_wake_source") == "window"
+                and event.get_result() is not None
+            ):
+                umo = event.unified_msg_origin
+                now = time.time()
+                seq = self._session_msg_seq.get(umo, 0)
+                prob = self._follow_up_hit_prob(umo, seq, now)
+                if prob <= 0 or random.random() >= prob:
+                    self._log(
+                        f"发送前窗口过滤丢弃回复 umo={umo} p={prob:.2f}",
+                        event=event,
+                    )
+                    event.clear_result()
+                    event.stop_event()
+                    return
+                if self.follow_up_window > 0:
+                    self._follow_up_start[umo] = now
+                    self._log(
+                        f"发送前判定通过，刷新跟随窗口 umo={umo}", event=event
+                    )
             # 记录自己上一条回复的位置：窗口内的「消息距离」因子以它为锚点
             if self.follow_up_window > 0 and event.get_result() is not None:
                 umo = event.unified_msg_origin
@@ -1262,18 +1308,14 @@ class WakeLitePlugin(Star):
                 event=event,
             )
 
-        # 窗口内信号全部未命中：按「时间 × 消息距离」概率兜底。
-        # 窗口判定命中的唤醒与其他唤醒源同级，黑名单的 sources 含 window。
+        # 窗口内信号全部未命中：窗口闸直接放行，概率判定留到 LLM 请求前
+        # （排队期间窗口可能过期/距离变化，届时再按「时间 × 消息距离」终判）。
         if in_window:
-            prob = self._follow_up_hit_prob(umo, seq, now)
-            if prob > 0 and random.random() < prob:
-                self._wake(
-                    event, uid, now,
-                    f"跟随窗口命中 umo={umo} p={prob:.2f}",
-                    source="window",
-                )
-            else:
-                self._log(f"跟随窗口未命中 umo={umo} p={prob:.2f}", event=event)
+            self._wake(
+                event, uid, now,
+                f"跟随窗口闸放行 umo={umo}（LLM 前终判）",
+                source="window",
+            )
 
     async def terminate(self):
         logger.info(f"{self._log_prefix()} 已停用")
